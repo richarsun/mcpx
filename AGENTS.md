@@ -59,7 +59,7 @@ CGO_ENABLED=0 go build -o bin/mcpx-server ./cmd/mcpx-server
 
 - 框架：Go 标准库 `testing`。
 - 命名：`*_test.go`，与被测包同目录（如 `internal/auth/token_test.go`）。
-- 改后端逻辑后应补/跑相关包测试；宣称完成前至少对改动包执行 `go test ./path/to/pkg -count=1`，合并前宜跑 `go test ./... -count=1`（与 CI 一致）。
+- 改后端逻辑后应补/跑相关包测试；宣称完成前至少对改动包执行 `go test ./path/to/pkg -count=1`，合并前按改动风险执行全仓检查并如实记录平台限制；当前 CI 不运行单测。
 - 支撑本次实现的必要回归测试随源码进入版本管理，无需逐项重复确认；临时实验、运行状态与私有材料不混入提交。
 
 ## 提交与 PR
