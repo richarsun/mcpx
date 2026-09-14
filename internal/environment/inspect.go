@@ -298,7 +298,7 @@ func inspectToolchainsWith(
 	commands := map[string][]string{
 		"go": {"go", "version"}, "git": {"git", "--version"}, "node": {"node", "--version"},
 		"npm": {"npm", "--version"}, "pnpm": {"pnpm", "--version"}, "yarn": {"yarn", "--version"},
-		"python": {"python3", "--version"}, "java": {"java", "-version"}, "rust": {"rustc", "--version"},
+		"python": {PythonExecutable(), "--version"}, "java": {"java", "-version"}, "rust": {"rustc", "--version"},
 		"cargo": {"cargo", "--version"}, "docker": {"docker", "--version"},
 	}
 	names := make([]string, 0, len(commands))

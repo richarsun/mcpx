@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -19,8 +20,21 @@ import (
 
 // 经真实 SDK Schema 和工具入口检查确认响应，不能用直接 handler 调用代替。
 func TestRuntimeConfirmationRecoveryThroughPublicSchema(t *testing.T) {
-	if _, err := exec.LookPath("node"); err != nil {
-		t.Skip("node unavailable")
+	testRuntimeConfirmationRecovery(t, "node", "node", "js", "require('fs').appendFileSync('效果.txt', '一次\\n', 'utf8');\n")
+}
+
+func TestPythonConfirmationRecoveryThroughPublicSchema(t *testing.T) {
+	python := "python3"
+	if runtime.GOOS == "windows" {
+		python = "python"
+	}
+	testRuntimeConfirmationRecovery(t, "python", python, "py", "with open('效果.txt', 'a', encoding='utf-8', newline='') as f:\n    f.write('一次\\n')\n")
+}
+
+func testRuntimeConfirmationRecovery(t *testing.T, runtimeName, executable, extension, script string) {
+	t.Helper()
+	if _, err := exec.LookPath(executable); err != nil {
+		t.Skip(executable + " unavailable")
 	}
 	rt := newWorkspaceRuntime(t, "恢复测试")
 	s := operationTestSession(t, rt, "恢复测试")
@@ -45,14 +59,14 @@ func TestRuntimeConfirmationRecoveryThroughPublicSchema(t *testing.T) {
 		}
 		return decodeToolResult(t, result)
 	}
-	script := "require('fs').appendFileSync('效果.txt', '一次\\n', 'utf8');\n"
-	request := map[string]any{"action": "run", "remote_session_id": s.ID, "purpose": "验证跨轮确认只执行一次", "scope": "workspace", "runtime": "node", "idempotency_key": "r12-recovery", "script": script}
+	scriptPath := "execution/r12-recovery/script." + extension
+	request := map[string]any{"action": "run", "remote_session_id": s.ID, "purpose": "验证跨轮确认只执行一次", "scope": "workspace", "runtime": runtimeName, "idempotency_key": "r12-recovery", "script": script}
 	body, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// 调用方复用 edit/read 保存并独立回读；不增加 Runtime 正文存储。
-	for path, content := range map[string]string{"execution/r12-recovery/script.js": script, "execution/r12-recovery/request.json": string(body)} {
+	for path, content := range map[string]string{scriptPath: script, "execution/r12-recovery/request.json": string(body)} {
 		saved := call("edit", map[string]any{"remote_session_id": s.ID, "purpose": "保存获准的非敏感原始请求", "edits": []any{map[string]any{"path": path, "operation": "create", "content": content}}})
 		if !statusOK(saved) {
 			t.Fatalf("保存失败: %+v", saved)
@@ -68,7 +82,7 @@ func TestRuntimeConfirmationRecoveryThroughPublicSchema(t *testing.T) {
 		content, _ := data["content"].(string)
 		return []byte(content), content == expected && data["truncated"] != true
 	}
-	if _, ok := readOriginal("execution/r12-recovery/script.js", script); !ok {
+	if _, ok := readOriginal(scriptPath, script); !ok {
 		t.Fatal("发送前脚本回读失败")
 	}
 	if _, ok := readOriginal("execution/r12-recovery/request.json", string(body)); !ok {
@@ -83,7 +97,7 @@ func TestRuntimeConfirmationRecoveryThroughPublicSchema(t *testing.T) {
 		t.Fatalf("原始脚本摘要缺失: %+v", data)
 	}
 	encoded, _ := json.Marshal(waiting)
-	for _, forbidden := range []string{"next_action", `"recovery"`, `"note"`, "appendFileSync"} {
+	for _, forbidden := range []string{"next_action", `"recovery"`, `"note"`, "appendFileSync", "with open("} {
 		if strings.Contains(string(encoded), forbidden) {
 			t.Fatalf("确认响应含无效重试模板或脚本正文: %s", forbidden)
 		}
@@ -95,7 +109,7 @@ func TestRuntimeConfirmationRecoveryThroughPublicSchema(t *testing.T) {
 	// 仅调用方故障夹具：缺失、正文被改和 read 拒绝都须在 execute 之前停止。
 	for _, fault := range []string{"missing", "changed", "denied"} {
 		t.Run(fault, func(t *testing.T) {
-			path := "execution/r12-recovery/script.js"
+			path := scriptPath
 			switch fault {
 			case "missing":
 				path = "execution/r12-recovery/missing.js"
@@ -126,7 +140,7 @@ func TestRuntimeConfirmationRecoveryThroughPublicSchema(t *testing.T) {
 	if !ok || sha256.Sum256(restoredBody) != sha256.Sum256(body) {
 		t.Fatal("原始请求回读校验失败")
 	}
-	if _, ok := readOriginal("execution/r12-recovery/script.js", script); !ok {
+	if _, ok := readOriginal(scriptPath, script); !ok {
 		t.Fatal("跨轮脚本回读失败")
 	}
 	if err := json.Unmarshal(restoredBody, &request); err != nil {

@@ -3,9 +3,31 @@ package environment
 import (
 	"context"
 	"errors"
+	"os/exec"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestInspectPythonReportsInstalledInterpreter(t *testing.T) {
+	python := "python3"
+	if runtime.GOOS == "windows" {
+		python = "python"
+	}
+	if _, err := exec.LookPath(python); err != nil {
+		t.Skip("Python unavailable")
+	}
+	result := inspectToolchainsWith(context.Background(), func(name string) (string, error) {
+		if name != python {
+			return "", errors.New("本测试只探测 Python")
+		}
+		return exec.LookPath(name)
+	}, commandOutput)
+	if info := result["python"]; !info.Available || !strings.HasPrefix(info.Version, "Python 3.") {
+		t.Fatalf("未识别已安装的 Python 3: %+v", info)
+	}
+}
 
 func TestInspectToolchainsRunsAvailableProbesConcurrently(t *testing.T) {
 	started := make(chan string, 16)
