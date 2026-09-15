@@ -36,6 +36,65 @@ func TestOpenAppliesMigrationsAndSecuresDatabase(t *testing.T) {
 	}
 }
 
+func TestAuthorizationGrantMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mcpx.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rows, err := store.DB().Query("PRAGMA table_info(authorization_grants)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns := map[string]bool{}
+	required := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		columns[name] = true
+		required[name] = notNull == 1 || primaryKey == 1
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{
+		"id", "remote_session_id", "workspace_name", "principal_id",
+		"authorization_context_id", "work_package_id", "goal", "scope_json",
+		"scope_digest", "grant_digest", "status", "source_request_id",
+		"source_command_digest", "created_at", "expires_at", "updated_at",
+	} {
+		if !columns[column] || !required[column] {
+			t.Fatalf("authorization_grants must require %s", column)
+		}
+	}
+	if columns["transport_session_id"] {
+		t.Fatal("authorization_grants must not bind transport_session_id")
+	}
+	for _, index := range []string{
+		"uq_authorization_grants_active_scope",
+		"idx_authorization_grants_context",
+		"idx_authorization_grants_expiry",
+	} {
+		var count int
+		if err := store.DB().QueryRow(
+			"SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+			index,
+		).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("missing authorization grant index %s", index)
+		}
+	}
+}
+
 func TestBusinessTablesOnlyUseRemoteSessionOwnership(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "mcpx.db")
 	store, err := Open(path)

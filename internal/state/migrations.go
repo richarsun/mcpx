@@ -451,6 +451,38 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_agent_activity_turns_session_seen
 		ON agent_activity_turns(remote_session_id, seen_at DESC);`,
 	`ALTER TABLE terminal_tasks ADD COLUMN limit_reason TEXT NOT NULL DEFAULT '';`,
+	`CREATE TABLE IF NOT EXISTS authorization_grants (
+		id TEXT PRIMARY KEY,
+		remote_session_id TEXT NOT NULL,
+		workspace_name TEXT NOT NULL,
+		principal_id TEXT NOT NULL,
+		authorization_context_id TEXT NOT NULL,
+		work_package_id TEXT NOT NULL,
+		goal TEXT NOT NULL,
+		scope_json TEXT NOT NULL,
+		scope_digest TEXT NOT NULL,
+		grant_digest TEXT NOT NULL,
+		status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'superseded', 'expired')),
+		source_request_id TEXT NOT NULL,
+		source_command_digest TEXT NOT NULL,
+		supersedes_grant_id TEXT,
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		revoked_at INTEGER,
+		revocation_reason TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY (remote_session_id) REFERENCES remote_sessions(id) ON DELETE CASCADE,
+		FOREIGN KEY (supersedes_grant_id) REFERENCES authorization_grants(id)
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS uq_authorization_grants_active_scope
+		ON authorization_grants(remote_session_id, workspace_name, principal_id,
+			authorization_context_id, work_package_id, goal, scope_digest)
+		WHERE status = 'active';
+	CREATE INDEX IF NOT EXISTS idx_authorization_grants_context
+		ON authorization_grants(remote_session_id, workspace_name, principal_id,
+			authorization_context_id, status, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_authorization_grants_expiry
+		ON authorization_grants(status, expires_at);`,
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB) error {

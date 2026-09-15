@@ -93,118 +93,69 @@ func (r *Runtime) toolCommandExecute(ctx context.Context, req *mcp.CallToolReque
 	if runtimeSpec != nil {
 		yieldForRequest = ephemeralRuntimeWait(envReq.Payload)
 	}
-	executeApproved := func(yield time.Duration) (*mcp.CallToolResult, error) {
-		if runtimeSpec == nil {
-			return r.executeApprovedCommandTask(ctx, envReq, principal, remote, command, yield, purpose, scope, commandDigest, analysis)
+	if decision == security.Deny {
+		deniedAuthorization := deniedCommandAuthorizationState(envReq.Payload)
+		if deniedAuthorization.Presented {
+			ctx = withCommandAuthorization(ctx, deniedAuthorization)
 		}
-		detail := runtimeExecutionDetail(purpose, scope, commandDigest, runtimeSpec, analysis)
-		if err := r.writeAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "execute", Command: command, Status: "preflight_approved", Detail: detail}); err != nil {
-			return r.terminalErrorForContext(ctx, envReq, remote.ID, remote.WorkspaceName, "audit_write_failed", "runtime preflight audit could not be persisted; script was not executed")
-		}
-		if runtimeSpec.Runtime == "sqlite" {
-			return r.executeSQLiteRuntime(ctx, envReq, remote, runtimeSpec, purpose, scope, commandDigest, analysis)
-		}
-		return r.executeRuntimeTask(ctx, envReq, principal, remote, runtimeSpec, purpose, scope, commandDigest, analysis)
-	}
-	switch decision {
-	case security.Deny:
-		r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "command_execute", Command: command, Status: "denied", Detail: runtimeExecutionDetail(purpose, scope, commandDigest, runtimeSpec, analysis)})
+		r.logAudit(audit.Event{
+			RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName,
+			Tool: "command_execute", Command: command, Status: "denied",
+			Detail: runtimeExecutionDetailWithAuthorization(ctx, purpose, scope, commandDigest, runtimeSpec, analysis),
+		})
 		message := "command denied by policy after auditing all command segments"
 		if containsUnsafeShellFeature(command) {
 			message += "；命令包含无法独立审计的 shell 特性。&&、|| 和 ; 会拆分后逐段审计；quoted heredoc（如 <<'PY'）会作为 literal stdin 随所属命令一起审计。管道、普通重定向、单个 &、任意多行 shell、$() 和反引号命令替换仍会拒绝；遇到这些情况请改用可独立审计的简单命令，例如 git fetch && git rev-parse HEAD && git status。"
 		}
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "denied", message)
-	case security.Confirm:
-		yield := yieldForRequest
-		confirmationToken := stringPayload(envReq.Payload, "confirmation_token")
-		if isCleanCoreRequest(ctx) {
-			userConfirmed := boolPayload(envReq.Payload, "user_confirmed")
-			pending, pendingOK := r.pendingCommandConfirmation(remote.ID, principal.ID, command, scope, commandDigest)
-			if !userConfirmed || !pendingOK {
-				if !pendingOK {
-					var confirmationErr error
-					pending, confirmationErr = r.approvals.PutPending(approval.Pending{
-						Tool: "command_execute", Summary: command, Command: command,
-						CommandYieldMs: int(yield / time.Millisecond), Purpose: purpose, Scope: scope,
-						CommandDigest: commandDigest, WorkDir: remote.WorkspacePath,
-						RequestID: envReq.RequestID, Workspace: remote.WorkspaceName,
-						RemoteSessionID: remote.ID, PrincipalID: principal.ID,
-						ContentKey: cleanCommandConfirmationContentKey(principal.ID, commandDigest),
-					})
-					if confirmationErr != nil {
-						return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "confirmation_store_error", confirmationErr.Error())
-					}
-				}
-				confirmationData := map[string]any{
-					"command": command, "purpose": purpose, "scope": scope,
-					"command_digest": commandDigest, "pending_digest": commandDigest,
-					"command_policy":        commandPolicyData(analysis),
-					"confirmation_required": true, "user_confirmed_required": true,
-					"summary": "执行已完成策略预检；请向用户展示命令或临时脚本摘要及用途，确认后将 user_confirmed=true 原样重试。",
-				}
-				addRuntimeConfirmationData(confirmationData, runtimeSpec)
-				response := envelope.Fail(envelope.StatusNeedConfirmation, envReq.RequestID, remote.WorkspaceName,
-					confirmationData, "USER_CONFIRMATION_REQUIRED", "命令执行等待用户语义确认")
-				response.RemoteSessionID = remote.ID
-				retryArguments := map[string]any{
-					"remote_session_id": remote.ID, "action": "run", "command": command,
-					"purpose": purpose, "scope": scope, "user_confirmed": true,
-				}
-				if runtimeSpec != nil {
-					retryArguments = runtimeConfirmationRetryArguments(remote.ID, purpose, scope, runtimeSpec)
-				}
-				addRecoveryAction(&response, "execute", "用户确认后使用相同 command/task 或 runtime+script、purpose 和 remote_session_id 重试，并设置 user_confirmed=true", retryArguments)
-				return r.resultJSON(response)
-			}
-			result, executeErr := executeApproved(yield)
-			if executeErr == nil {
-				if _, consumed := r.approvals.Consume(pending.ID); !consumed {
-					return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "confirmation_state_error", "confirmed command approval could not be consumed")
-				}
-			}
-			return result, executeErr
-		}
-		if !r.hasPendingCommandConfirmation(remote.ID, principal.ID, command, purpose, scope, confirmationToken) {
-			pending, confirmationErr := r.approvals.PutPending(approval.Pending{
-				Tool: "command_execute", Summary: command, Command: command,
-				CommandYieldMs: int(yield / time.Millisecond), Purpose: purpose, Scope: scope,
-				CommandDigest: commandDigest, WorkDir: remote.WorkspacePath,
-				RequestID: envReq.RequestID, Workspace: remote.WorkspaceName,
-				RemoteSessionID: remote.ID, PrincipalID: principal.ID,
-			})
-			if confirmationErr != nil {
-				return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "confirmation_store_error", confirmationErr.Error())
-			}
-			// Struct field order puts confirmation_token first in the JSON
-			// text, so host previews that truncate long tool output still show
-			// the full token to the model.
-			confirmationMessage := "confirmation_token: " + pending.ConfirmationToken + "；请向用户展示命令及用途，获得明确语义确认后，使用相同 command 和该 confirmation_token 重试。该 token 仅绑定本次操作，不承担认证职责。"
-			if confirmationToken != "" {
-				confirmationMessage = "你提供的 confirmation_token 未匹配当前待确认项；请使用本响应 data.confirmation_token 中的完整 token 原样重试：" + pending.ConfirmationToken + "（相同 command、remote_session_id 和 scope）。"
-			}
-			confirmationData := commandConfirmationData{
-				ConfirmationToken:    pending.ConfirmationToken,
-				Command:              command,
-				Purpose:              purpose,
-				Scope:                scope,
-				CommandDigest:        commandDigest,
-				CommandPolicy:        commandPolicyData(analysis),
-				ConfirmationRequired: true,
-				ConfirmationMessage:  confirmationMessage,
-			}
-			response := envelope.Fail(envelope.StatusNeedConfirmation, envReq.RequestID, remote.WorkspaceName,
-				confirmationData, "USER_CONFIRMATION_REQUIRED", "命令执行等待用户语义确认")
-			response.RemoteSessionID = remote.ID
-			return r.resultJSON(response)
-		}
-		result, executeErr := executeApproved(yield)
-		if executeErr == nil {
-			r.consumePendingCommandConfirmation(remote.ID, principal.ID, command, purpose, scope, confirmationToken)
-		}
-		return result, executeErr
 	}
 
-	return executeApproved(yieldForRequest)
+	authorizationState, authorizationErr := r.evaluateCommandAuthorization(
+		ctx, envReq.Payload, principal, remote, command, purpose, analysis,
+	)
+	if authorizationErr != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", authorizationErr.Error())
+	}
+	if authorizationState.Presented && !isCleanCoreRequest(ctx) {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", "conversation authorization is available only through clean-core execute")
+	}
+	if authorizationState.Request != nil {
+		payloadDigest = combinedCommandPayloadDigest(payloadDigest, authorizationState.RequestDigest)
+		commandDigest = commandRequestDigestWithPayload(
+			envReq.RequestID, remote.ID, remote.WorkspaceName,
+			command, purpose, scope, payloadDigest,
+		)
+	}
+	if authorizationState.matchedGrant() {
+		if decision == security.Confirm {
+			authorizationState.Decision = "grant_reused"
+		} else {
+			authorizationState.Decision = "grant_matched_policy_allow"
+		}
+	}
+	if authorizationState.Presented {
+		ctx = withCommandAuthorization(ctx, authorizationState)
+	}
+
+	executeApproved := func(executionCtx context.Context, yield time.Duration) (*mcp.CallToolResult, error) {
+		if runtimeSpec == nil {
+			return r.executeApprovedCommandTask(executionCtx, envReq, principal, remote, command, yield, purpose, scope, commandDigest, analysis)
+		}
+		detail := runtimeExecutionDetailWithAuthorization(executionCtx, purpose, scope, commandDigest, runtimeSpec, analysis)
+		if err := r.writeAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "execute", Command: command, Status: "preflight_approved", Detail: detail}); err != nil {
+			return r.terminalErrorForContext(executionCtx, envReq, remote.ID, remote.WorkspaceName, "audit_write_failed", "runtime preflight audit could not be persisted; script was not executed")
+		}
+		if runtimeSpec.Runtime == "sqlite" {
+			return r.executeSQLiteRuntime(executionCtx, envReq, remote, runtimeSpec, purpose, scope, commandDigest, analysis)
+		}
+		return r.executeRuntimeTask(executionCtx, envReq, principal, remote, runtimeSpec, purpose, scope, commandDigest, analysis)
+	}
+	return r.executeWithCommandConfirmation(
+		ctx, envReq, principal, remote,
+		command, purpose, scope, commandDigest,
+		analysis, runtimeSpec, yieldForRequest,
+		authorizationState, executeApproved,
+	)
 }
 
 // commandConfirmationData keeps confirmation_token first in the serialized
@@ -221,7 +172,7 @@ type commandConfirmationData struct {
 }
 
 func (r *Runtime) executeApprovedCommandTask(ctx context.Context, envReq envelope.Request, principal auth.Principal, remote remotesession.Session, command string, yield time.Duration, purpose, scope, commandDigest string, analysis security.CommandAnalysis) (*mcp.CallToolResult, error) {
-	detail := commandExecutionDetail(purpose, scope, commandDigest, analysis)
+	detail := commandExecutionDetailWithAuthorization(ctx, purpose, scope, commandDigest, analysis)
 	if err := r.writeAudit(audit.Event{
 		RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName,
 		Tool: "command_execute", Command: command, Status: "preflight_approved", Detail: detail,
@@ -236,11 +187,32 @@ func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Reques
 	if originTool == "" {
 		originTool = "command_execute"
 	}
-	task, err := r.tasks.StartRemoteWithObservationContext(ctx, envReq.RequestID, observationCallID(envReq), originTool, remote.ID, remote.WorkspaceName, remote.WorkspacePath, command)
+	var task *terminal.Task
+	var err error
+	if authorizationState, ok := commandAuthorizationFromContext(ctx); ok && authorizationState.matchedGrant() {
+		if strings.TrimSpace(authorizationState.Action.Executable) == "" {
+			return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "start_error", "grant-backed command has no pinned executable")
+		}
+		task, err = r.tasks.StartRemoteProcessWithObservationContext(
+			envReq.RequestID,
+			observationCallID(envReq),
+			originTool,
+			remote.ID,
+			remote.WorkspaceName,
+			remote.WorkspacePath,
+			command,
+			terminal.ProcessSpec{
+				Executable: authorizationState.Action.Executable,
+				Args:       append([]string(nil), authorizationState.Action.Arguments...),
+			},
+		)
+	} else {
+		task, err = r.tasks.StartRemoteWithObservationContext(ctx, envReq.RequestID, observationCallID(envReq), originTool, remote.ID, remote.WorkspaceName, remote.WorkspacePath, command)
+	}
 	if err != nil {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "start_error", err.Error())
 	}
-	_ = r.remote.AddEvent(ctx, principal, remotesession.Event{RemoteSessionID: remote.ID, Type: "command.started", OperationID: task.ID, Summary: command, Metadata: commandExecutionDetail(purpose, scope, commandDigest, analysis)})
+	_ = r.remote.AddEvent(ctx, principal, remotesession.Event{RemoteSessionID: remote.ID, Type: "command.started", OperationID: task.ID, Summary: command, Metadata: commandExecutionDetailWithAuthorization(ctx, purpose, scope, commandDigest, analysis)})
 	waitCtx, cancel := context.WithTimeout(ctx, yield)
 	completed := task.Wait(waitCtx)
 	cancel()
@@ -252,11 +224,12 @@ func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Reques
 	data["command"] = command
 	data["working_directory"] = remote.WorkspacePath
 	data["workspace_scoped"] = scope == "workspace"
+	addCommandAuthorizationData(ctx, data)
 	capTaskExecutionOutput(data, config.MaxResultBytes(r.cfg.Limits))
 	if completed {
 		data["completed_in_call"] = true
 		delete(data, "execution_task_id")
-		detail := commandExecutionDetail(purpose, scope, commandDigest, analysis)
+		detail := commandExecutionDetailWithAuthorization(ctx, purpose, scope, commandDigest, analysis)
 		detail["exit_code"] = data["exit_code"]
 		if code, message := annotateExecutionOutcome(data); code != "" {
 			response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, data, code, message)
@@ -278,7 +251,7 @@ func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Reques
 		"yield_time_ms": int(yield / time.Millisecond),
 	})
 	data["summary"] = fmt.Sprintf("Command is running as Task %s.", task.ID)
-	detail := commandExecutionDetail(purpose, scope, commandDigest, analysis)
+	detail := commandExecutionDetailWithAuthorization(ctx, purpose, scope, commandDigest, analysis)
 	detail["execution_task_id"] = task.ID
 	r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "command_execute", Command: command, Status: "running", Detail: detail})
 	response := envelope.Accepted(envReq.RequestID, remote.WorkspaceName, data)
@@ -573,7 +546,7 @@ func (r *Runtime) executeSQLiteRuntime(ctx context.Context, envReq envelope.Requ
 	queryCtx, cancel := context.WithTimeout(ctx, ephemeralRuntimeMaxWait)
 	defer cancel()
 	result, err := sqlitequery.Query(queryCtx, remote.WorkspacePath, spec.Database, spec.Script, sqlitequery.DefaultMaxRows, config.MaxResultBytes(r.cfg.Limits))
-	detail := runtimeExecutionDetail(purpose, scope, commandDigest, spec, analysis)
+	detail := runtimeExecutionDetailWithAuthorization(ctx, purpose, scope, commandDigest, spec, analysis)
 	if err != nil {
 		detail["error"] = err.Error()
 		r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "execute", Command: spec.Command, Status: "error", Detail: detail})
@@ -582,6 +555,7 @@ func (r *Runtime) executeSQLiteRuntime(ctx context.Context, envReq envelope.Requ
 			"script_sha256": spec.ScriptSHA256, "script_bytes": spec.ScriptBytes,
 			"working_directory": remote.WorkspacePath, "workspace_scoped": true,
 		}
+		addCommandAuthorizationData(ctx, data)
 		response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, data, "SQLITE_QUERY_ERROR", err.Error())
 		response.RemoteSessionID = remote.ID
 		return r.resultJSON(response)
@@ -593,6 +567,7 @@ func (r *Runtime) executeSQLiteRuntime(ctx context.Context, envReq envelope.Requ
 		"purpose": purpose, "scope": scope, "command_digest": commandDigest,
 		"working_directory": remote.WorkspacePath, "workspace_scoped": true, "completed_in_call": true,
 	}
+	addCommandAuthorizationData(ctx, data)
 	detail["row_count"] = result.RowCount
 	detail["truncated"] = result.Truncated
 	r.logAudit(audit.Event{RequestID: envReq.RequestID, RemoteSessionID: remote.ID, Workspace: remote.WorkspaceName, Tool: "execute", Command: spec.Command, Status: "ok", Detail: detail})
@@ -614,7 +589,7 @@ func (r *Runtime) executeRuntimeTask(ctx context.Context, envReq envelope.Reques
 	if err != nil {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "RUNTIME_START_ERROR", err.Error())
 	}
-	detail := runtimeExecutionDetail(purpose, scope, commandDigest, spec, analysis)
+	detail := runtimeExecutionDetailWithAuthorization(ctx, purpose, scope, commandDigest, spec, analysis)
 	_ = r.remote.AddEvent(ctx, principal, remotesession.Event{
 		RemoteSessionID: remote.ID, Type: "command.started", OperationID: task.ID,
 		Summary: fmt.Sprintf("%s ephemeral script", spec.Runtime), Metadata: detail,
@@ -636,6 +611,7 @@ func (r *Runtime) executeRuntimeTask(ctx context.Context, envReq envelope.Reques
 	data["workspace_scoped"] = true
 	data["wall_limit_ms"] = ephemeralRuntimeWallLimit.Milliseconds()
 	data["cpu_time_limit_ms"] = ephemeralRuntimeCPUTimeLimit.Milliseconds()
+	addCommandAuthorizationData(ctx, data)
 	if runtime.GOOS == "windows" {
 		data["cpu_limit_enforcement"] = "unavailable_windows"
 	} else {

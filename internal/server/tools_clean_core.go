@@ -110,19 +110,29 @@ func (r *Runtime) registerCleanCoreTools(s *mcp.Server) {
 	r.addTool(s, cleanCoreTool("workspace", desc["workspace"], map[string]any{}, nil, readOnlyToolAnnotation), r.toolWorkspace)
 
 	r.addTool(s, cleanCoreTool("session", desc["session"], map[string]any{
-		"remote_session_id":            remoteSession,
-		"action":                       enumSchema("会话生命周期动作；省略时默认 open/resume，传 mode 时可省略并推导 close；remote_session_id 丢失时显式 list 发现已有会话", "open", "list", "close"),
-		"workspace":                    workspace,
-		"query":                        stringSchema("list 时按 label、description 或 Session ID 搜索"),
-		"status":                       stringSchema("list 时按状态过滤；多个状态用逗号分隔"),
-		"cursor":                       stringSchema("list 分页游标"),
-		"limit":                        numberSchema("list 返回数量限制"),
-		"label":                        stringSchema("会话标签"),
-		"description":                  stringSchema("开发目标或会话描述"),
-		"client_request_id":            stringSchema("客户端幂等键"),
-		"include_instructions_content": booleanSchema("是否内联返回指令内容"),
-		"include_project_tasks":        booleanSchema("是否返回项目任务"),
-		"mode":                         enumSchema("关闭模式；出现时省略 action 也会推导 close", "closed", "archived"),
+		"remote_session_id":              remoteSession,
+		"action":                         enumSchema("会话或对话级授权生命周期动作；省略时默认 open/resume，传 mode 时可省略并推导 close", "open", "list", "close", "authorization_list", "authorization_revoke", "authorization_narrow"),
+		"workspace":                      workspace,
+		"query":                          stringSchema("list 时按 label、description 或 Session ID 搜索"),
+		"status":                         stringSchema("list 时按状态过滤；多个状态用逗号分隔"),
+		"cursor":                         stringSchema("list 分页游标"),
+		"limit":                          numberSchema("list 返回数量限制"),
+		"label":                          stringSchema("会话标签"),
+		"description":                    stringSchema("开发目标或会话描述"),
+		"client_request_id":              stringSchema("客户端幂等键"),
+		"include_instructions_content":   booleanSchema("是否内联返回指令内容"),
+		"include_project_tasks":          booleanSchema("是否返回项目任务"),
+		"mode":                           enumSchema("关闭模式；出现时省略 action 也会推导 close", "closed", "archived"),
+		"purpose":                        stringSchema("撤销或缩小授权的用户可见目的；authorization_list 不需要"),
+		"authorization_context_id":       stringSchema("当前 Chat 对话/授权上下文的稳定 ID；新对话不得复用旧 ID"),
+		"authorization_grant_id":         stringSchema("待撤销或缩小的 grant ID"),
+		"authorization_include_inactive": booleanSchema("authorization_list 是否包含已撤销、已替代和已过期历史"),
+		"authorization_reason":           stringSchema("撤销或缩小授权的审计原因；省略时使用 purpose"),
+		"authorization_scope":            authorizationScopeInputSchema("缩小后的完整授权边界；不得扩大任一维度"),
+		"authorization_expires_at": map[string]any{
+			"type": "string", "format": "date-time",
+			"description": "缩小授权的新到期时间（RFC3339）；不得晚于原 grant",
+		},
 	}, nil, sessionToolAnnotation), r.toolSession)
 
 	readItems := arraySchema(map[string]any{
