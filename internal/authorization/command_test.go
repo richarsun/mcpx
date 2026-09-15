@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -524,6 +525,25 @@ func TestClassifierRejectsDeletedDirectoryGitAdd(t *testing.T) {
 	}
 }
 
+func TestClassifierRejectsCommitWhenUnstagedTrackedFileHasActiveFilter(t *testing.T) {
+	workspace, repo := newGitFixture(t)
+	ctx := withGrantTestExecutables(t, context.Background())
+
+	writeFile(t, filepath.Join(repo, ".gitattributes"), "other.txt filter=reviewprobe\n")
+	runGit(t, repo, "add", "--", ".gitattributes")
+	runGit(t, repo, "commit", "-m", "record filter attributes without a configured command")
+	runGit(t, repo, "config", "filter.reviewprobe.clean", "external-helper")
+	writeFile(t, filepath.Join(repo, "docs", "allowed.md"), "allowed change\n")
+	runGit(t, repo, "add", "--", "docs/allowed.md")
+	writeFile(t, filepath.Join(repo, "other.txt"), "unstaged change that is outside the grant write domain\n")
+
+	action := ClassifyCommand(ctx, workspace, []string{"git -C repo commit --dry-run -m ordinary"})
+	if action.Eligible {
+		t.Fatalf("commit with an active filter on an unstaged tracked file became grant eligible: %+v", action)
+	}
+	assertContains(t, action.Reasons, "segment_1:git_commit_external_filter_not_supported")
+}
+
 func TestClassifierRejectsAutomaticCommitSigning(t *testing.T) {
 	workspace, repo := newGitFixture(t)
 	writeFile(t, filepath.Join(repo, "docs", "allowed.md"), "signed change\n")
@@ -560,6 +580,31 @@ func TestClassifierRejectsGitRemoteCommandOverrides(t *testing.T) {
 	}
 }
 
+func TestClassifierRejectsRemoteHelperProtocolAndVCSOverride(t *testing.T) {
+	t.Run("unknown protocol helper", func(t *testing.T) {
+		workspace, repo := newGitFixture(t)
+		ctx := withGrantTestExecutables(t, context.Background())
+		runGit(t, repo, "remote", "set-url", "origin", "reviewprobe://github.com/owner/repo")
+		action := ClassifyCommand(ctx, workspace, []string{"git -C repo fetch --no-tags --refmap= origin main"})
+		if action.Eligible {
+			t.Fatalf("unknown Git remote helper protocol became grant eligible: %+v", action)
+		}
+		assertContains(t, action.Reasons, "segment_1:unresolved_git_remote:origin")
+	})
+
+	t.Run("remote vcs helper override", func(t *testing.T) {
+		workspace, repo := newGitFixture(t)
+		ctx := withGrantTestExecutables(t, context.Background())
+		runGit(t, repo, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
+		runGit(t, repo, "config", "remote.origin.vcs", "reviewvcs")
+		action := ClassifyCommand(ctx, workspace, []string{"git -C repo fetch --no-tags --refmap= origin main"})
+		if action.Eligible {
+			t.Fatalf("remote.<name>.vcs helper override became grant eligible: %+v", action)
+		}
+		assertContains(t, action.Reasons, "segment_1:unresolved_git_remote:origin")
+	})
+}
+
 func TestClassifierRejectsNetworkGitCommandOverrides(t *testing.T) {
 	workspace, repo := newGitFixture(t)
 	ctx := context.Background()
@@ -590,6 +635,54 @@ func TestClassifierRejectsNetworkGitCommandOverrides(t *testing.T) {
 			t.Fatalf("repository-local credential helper became grant eligible: %+v", action)
 		}
 	})
+}
+
+func TestClassifierPinsFetchNoSubmoduleRecursion(t *testing.T) {
+	workspace, _ := newGitFixture(t)
+	ctx := withGrantTestExecutables(t, context.Background())
+	action := ClassifyCommand(ctx, workspace, []string{"git -C repo fetch --no-tags --refmap= origin main"})
+	if !action.Eligible {
+		t.Fatalf("ordinary bounded fetch was not grant eligible: %+v", action)
+	}
+	count := 0
+	for _, argument := range action.Arguments {
+		if argument == "--recurse-submodules=no" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("grant-backed fetch must pin exactly one --recurse-submodules=no in executed argv: %+v", action.Arguments)
+	}
+}
+
+func TestClassifierRejectsHiddenInitializedSubmodule(t *testing.T) {
+	workspace, repo := newGitFixture(t)
+	ctx := withGrantTestExecutables(t, context.Background())
+	child := filepath.Join(workspace, "child-source")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, child, "init")
+	runGit(t, child, "config", "user.email", "submodule@example.invalid")
+	runGit(t, child, "config", "user.name", "Submodule Fixture")
+	writeFile(t, filepath.Join(child, "child.txt"), "child\n")
+	runGit(t, child, "add", "--", "child.txt")
+	runGit(t, child, "commit", "-m", "child fixture")
+	runGit(t, repo, "-c", "protocol.file.allow=always", "submodule", "add", child, "module")
+	runGit(t, repo, "commit", "-m", "add initialized submodule")
+	if err := os.Rename(filepath.Join(repo, ".gitmodules"), filepath.Join(repo, ".gitmodules.hidden")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".gitmodules")); !os.IsNotExist(err) {
+		t.Fatalf("worktree .gitmodules should be absent for the regression fixture: %v", err)
+	}
+	runGit(t, repo, "config", "fetch.recurseSubmodules", "true")
+
+	action := ClassifyCommand(ctx, workspace, []string{"git -C repo fetch --no-tags --refmap= origin main"})
+	if action.Eligible {
+		t.Fatalf("fetch in repository with hidden initialized submodule became grant eligible: %+v", action)
+	}
+	assertContains(t, action.Reasons, "segment_1:repository_outside_workspace_or_unsafe_automation")
 }
 
 func TestClassifierFetchRequiresEmptyRefmap(t *testing.T) {
@@ -722,6 +815,83 @@ func TestClassifierRejectsSwitchToBranchWithActiveFilter(t *testing.T) {
 		t.Fatalf("switch to target branch with active filter became grant eligible: %+v", action)
 	}
 	assertContains(t, action.Reasons, "segment_1:git_switch_target_external_filter_not_supported")
+}
+
+func TestResolveGrantExecutableRejectsWorkspaceExternalPATHShadowBeforeProbe(t *testing.T) {
+	workspace := t.TempDir()
+	outside := t.TempDir()
+	marker := filepath.Join(outside, "shadow-executed.txt")
+	name := "git"
+	content := []byte("#!/bin/sh\nprintf shadow > '" + filepath.ToSlash(marker) + "'\nexit 0\n")
+	if runtime.GOOS == "windows" {
+		name = "git.cmd"
+		content = []byte("@echo off\r\n> \"" + marker + "\" echo shadow\r\nexit /b 0\r\n")
+	}
+	shadow := filepath.Join(outside, name)
+	if err := os.WriteFile(shadow, content, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", outside+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	action := ClassifyCommand(context.Background(), workspace, []string{"git status --short"})
+	if action.Eligible {
+		t.Fatalf("workspace-external PATH shadow produced a grant-eligible action: %+v", action)
+	}
+	assertContains(t, action.Reasons, "segment_1:cannot_resolve_trusted_executable:git")
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("workspace-external PATH shadow executed during classification: %v", err)
+	}
+}
+
+func TestGitReadTargetsRespectGrantAndNarrowing(t *testing.T) {
+	workspace, _ := newGitFixture(t)
+	ctx := withGrantTestExecutables(t, context.Background())
+	commands := []string{
+		"git -C repo log --oneline main",
+		"git -C repo diff --no-ext-diff --no-textconv main",
+		"git -C repo show --no-ext-diff --no-textconv --oneline --stat main",
+	}
+	for _, command := range commands {
+		action := ClassifyCommand(ctx, workspace, []string{command})
+		if !action.Eligible {
+			t.Fatalf("explicit Git read target was not classifiable: %s => %+v", command, action)
+		}
+		assertContains(t, action.Targets, "branch:main")
+	}
+
+	now := time.Date(2026, 9, 15, 8, 0, 0, 0, time.UTC)
+	wideScope, err := NormalizeScope(Scope{
+		PurposePatterns: []string{"issue 861*"},
+		ActionClasses:   []string{"git_read"},
+		Repositories:    []string{"workspace:repo"},
+		Targets:         []string{"branch:main", "branch:feat/*"},
+		RiskCeiling:     RiskOrdinary,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowScope, err := NormalizeScope(Scope{
+		PurposePatterns: []string{"issue 861*"},
+		ActionClasses:   []string{"git_read"},
+		Repositories:    []string{"workspace:repo"},
+		Targets:         []string{"branch:feat/*"},
+		RiskCeiling:     RiskOrdinary,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := IsStrictSubset(narrowScope, wideScope); err != nil || !changed {
+		t.Fatalf("expected target removal to be a valid narrow operation: changed=%v err=%v", changed, err)
+	}
+	mainRead := ClassifyCommand(ctx, workspace, []string{"git -C repo log --oneline main"})
+	if match := Match(Grant{Status: StatusActive, Scope: wideScope, ExpiresAt: now.Add(time.Hour)}, "issue 861 implementation", mainRead, now); !match.Matched {
+		t.Fatalf("main read should match before narrowing: %+v", match)
+	}
+	match := Match(Grant{Status: StatusActive, Scope: narrowScope, ExpiresAt: now.Add(time.Hour)}, "issue 861 implementation", mainRead, now)
+	if match.Matched {
+		t.Fatalf("read of removed branch target matched after narrowing: %+v", match)
+	}
+	assertContains(t, match.Reasons, "target_out_of_scope:branch:main")
 }
 
 func TestUnsafePathTextRejectsControlCharacters(t *testing.T) {

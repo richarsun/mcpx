@@ -118,6 +118,7 @@ func TestConversationAuthorizationRecoveryArgumentsRoundTripWithoutOptionalArray
 			"purpose_patterns":   []string{"issue 861*"},
 			"action_classes":     []string{"git_read"},
 			"repositories":       []string{"workspace:repo"},
+			"targets":            []string{"branch:feat/issue-861"},
 			"risk_ceiling":       "ordinary",
 			"expires_in_seconds": 3600,
 		},
@@ -145,10 +146,11 @@ func TestConversationAuthorizationRecoveryArgumentsRoundTripWithoutOptionalArray
 	if !ok {
 		t.Fatalf("confirmation retry authorization missing: %+v", retryArguments)
 	}
-	for _, optional := range []string{"targets", "write_paths"} {
-		if value, exists := retryAuthorization[optional]; exists {
-			t.Fatalf("empty optional field %q must be omitted, got %#v", optional, value)
-		}
+	if !jsonStringSliceContains(retryAuthorization["targets"], "branch:feat/issue-861") {
+		t.Fatalf("recovery arguments dropped the read target: %+v", retryAuthorization)
+	}
+	if value, exists := retryAuthorization["write_paths"]; exists {
+		t.Fatalf("empty optional write_paths must be omitted, got %#v", value)
 	}
 	if retryArguments["user_confirmed"] != true {
 		t.Fatalf("recovery arguments did not carry user_confirmed=true: %+v", retryArguments)
@@ -242,6 +244,7 @@ func TestConversationAuthorizationLifecycleRecoveryNarrowAndRevoke(t *testing.T)
 			"purpose_patterns": []string{"issue 861*"},
 			"action_classes":   []string{"git_read"},
 			"repositories":     []string{"workspace:repo"},
+			"targets":          []string{"branch:feat/*"},
 			"risk_ceiling":     "ordinary",
 		},
 	}

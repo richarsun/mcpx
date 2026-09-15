@@ -40,12 +40,12 @@
 - [x] deny 优先；撤销后下一动作受限；新 context 不继承。
 - [x] 高风险命令不复用；`move_out` 强制 confirmation UUID 不变。
 - [x] Runtime 重启／重试后 grant 一致且无重复 active grant。
-- [x] Windows `internal/authorization` 全测与 `TestConversationAuthorization*` 聚焦回归通过；Linux gofmt、diff-check、普通 build、vet、CGO=0 build、authorization 全测、整仓 `go test ./... -count=1` 及 `go test -race ./internal/authorization ./internal/server -count=1` 均通过；OpenSpec CURRENT/change 全量 strict validation 为 2/2 PASS。此前 full-repo race 的 `internal/oauth/TestLoadOrCreateTokenSecretConcurrentFirstUse` 间歇失败已在 exact base `3f81d08` 上复现，#861 未修改 OAuth，未越界修复。
+- [x] 首个冻结候选 `e37eec9` 的独立 Reviewer 结论为 NEEDS_FIX，指出 5 个 P1：commit 未暂存文件 filter、remote helper / `remote.<name>.vcs`、隐藏子模块递归 fetch、Workspace 外 PATH wrapper、Git read target 丢失。修复后新增逐项负向回归并通过；Windows `internal/authorization` 全测与 `TestConversationAuthorization*` Runtime E2E 通过；Linux gofmt、diff-check、普通 build、vet、CGO=0 build、authorization 全测、整仓 `go test ./... -count=1` 及 `go test -race ./internal/authorization ./internal/server -count=1` 均重新通过；OpenSpec CURRENT/change 全量 strict validation 为 2/2 PASS。此前 full-repo race 的 `internal/oauth/TestLoadOrCreateTokenSecretConcurrentFirstUse` 间歇失败已在 exact base `3f81d08` 上复现，#861 未修改 OAuth，未越界修复。
 
 ## 6. 交付与质量门
 
 - [x] 作者自检完整 diff、规格映射、风险和未覆盖项。
 - [ ] commit/push 独立 feature branch，记录 exact commit/tree。
-- [ ] 建 Draft PR，关联 #861，附实际命令与结果。
-- [ ] 公共授权协议／安全边界变化必须进入独立 Reviewer；作者不得自签，未放行前保持 Draft/Review required。
-- [ ] #861 回写实现、验证、PR、剩余风险和明确“未部署”。
+- [x] 已建 Draft PR `richarsun/mcpx#3` 并关联 #861；首个冻结候选 `e37eec9` 已提交审查。
+- [ ] 公共授权协议／安全边界变化必须进入独立 Reviewer；首审 `e37eec9` 为 NEEDS_FIX，5 个 P1 修复完成且门禁重跑通过，仍须对新的冻结候选复审 PASS，作者不得自签，放行前保持 Draft/Review required。
+- [ ] #861 需在新修复 commit/tree push 后再次回写验证、Reviewer 修复、PR 和剩余风险，并明确“未部署”。

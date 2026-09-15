@@ -83,13 +83,6 @@ func resolveGrantExecutable(ctx context.Context, workspaceRoot, name string) (st
 	if err != nil || !info.Mode().IsRegular() {
 		return "", errors.New("trusted executable path is not a regular file")
 	}
-	if runtime.GOOS == "windows" {
-		if !strings.EqualFold(filepath.Base(resolved), name+".exe") {
-			return "", fmt.Errorf("trusted %s executable must resolve to %s.exe", name, name)
-		}
-	} else if info.Mode().Perm()&0o111 == 0 {
-		return "", errors.New("trusted executable path is not executable")
-	}
 
 	rootAbs, err := filepath.Abs(workspaceRoot)
 	if err != nil {
@@ -102,7 +95,93 @@ func resolveGrantExecutable(ctx context.Context, workspaceRoot, name string) (st
 	if _, err := workspaceRelative(resolvedRoot, resolved); err == nil {
 		return "", errors.New("trusted executable resolves inside the workspace")
 	}
+	if err := validateTrustedGrantExecutable(name, resolved, info); err != nil {
+		return "", err
+	}
 	return resolved, nil
+}
+
+func validateTrustedGrantExecutable(name, resolved string, info os.FileInfo) error {
+	if runtime.GOOS == "windows" {
+		if !strings.EqualFold(filepath.Base(resolved), name+".exe") {
+			return fmt.Errorf("trusted %s executable must resolve to %s.exe", name, name)
+		}
+		trusted := false
+		for _, environmentName := range []string{"ProgramFiles", "ProgramFiles(x86)"} {
+			root := strings.TrimSpace(os.Getenv(environmentName))
+			if root == "" {
+				continue
+			}
+			var candidates []string
+			switch name {
+			case "git":
+				candidates = []string{
+					filepath.Join(root, "Git", "cmd", "git.exe"),
+					filepath.Join(root, "Git", "bin", "git.exe"),
+					filepath.Join(root, "Git", "mingw64", "bin", "git.exe"),
+				}
+			case "gh":
+				candidates = []string{filepath.Join(root, "GitHub CLI", "gh.exe")}
+			}
+			for _, expected := range candidates {
+				if strings.EqualFold(filepath.Clean(resolved), filepath.Clean(expected)) {
+					trusted = true
+					break
+				}
+			}
+			if trusted {
+				break
+			}
+		}
+		if !trusted {
+			return fmt.Errorf("trusted %s executable is not in a supported system installation path", name)
+		}
+	} else {
+		if info.Mode().Perm()&0o111 == 0 {
+			return errors.New("trusted executable path is not executable")
+		}
+		directory := filepath.Clean(filepath.Dir(resolved))
+		if directory != "/usr/bin" && directory != "/bin" {
+			return fmt.Errorf("trusted %s executable is not in a supported system installation path", name)
+		}
+	}
+
+	trustedBinary, err := executableHasTrustedBinaryFormat(resolved)
+	if err != nil {
+		return err
+	}
+	if !trustedBinary {
+		return fmt.Errorf("trusted %s executable has an unsupported binary format", name)
+	}
+	return nil
+}
+
+func executableHasTrustedBinaryFormat(filePath string) (bool, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	header := make([]byte, 4)
+	count, err := file.Read(header)
+	if err != nil && count == 0 {
+		return false, err
+	}
+	if runtime.GOOS == "windows" {
+		return count >= 2 && header[0] == 'M' && header[1] == 'Z', nil
+	}
+	if count < 4 {
+		return false, nil
+	}
+	magic := uint32(header[0])<<24 | uint32(header[1])<<16 | uint32(header[2])<<8 | uint32(header[3])
+	switch magic {
+	case 0x7f454c46, // ELF
+		0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe, // Mach-O
+		0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca: // universal Mach-O
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 // ClassifyCommand converts already policy-split shell segments into the exact
@@ -190,9 +269,45 @@ func classifySegment(ctx context.Context, workspaceRoot, raw string) Action {
 	}
 	if action.Eligible {
 		action.Executable = executablePath
-		action.Arguments = append([]string(nil), words[1:]...)
+		arguments := append([]string(nil), words[1:]...)
+		if executable == "git" && action.Summary == "git fetch" {
+			arguments, err = pinGitFetchNoRecurse(arguments)
+			if err != nil {
+				return ineligible("cannot_pin_git_fetch_no_submodule_recursion")
+			}
+		}
+		action.Arguments = arguments
 	}
 	return action
+}
+
+func pinGitFetchNoRecurse(args []string) ([]string, error) {
+	for index := 0; index < len(args); {
+		switch args[index] {
+		case "-C":
+			if index+1 >= len(args) {
+				return nil, errors.New("git -C requires path")
+			}
+			index += 2
+		case "--no-pager", "--literal-pathspecs":
+			index++
+		default:
+			if !strings.EqualFold(args[index], "fetch") {
+				return nil, errors.New("git fetch subcommand not found")
+			}
+			for _, arg := range args[index+1:] {
+				if arg == "--recurse-submodules=no" {
+					return append([]string(nil), args...), nil
+				}
+			}
+			result := make([]string, 0, len(args)+1)
+			result = append(result, args[:index+1]...)
+			result = append(result, "--recurse-submodules=no")
+			result = append(result, args[index+1:]...)
+			return result, nil
+		}
+	}
+	return nil, errors.New("git fetch subcommand not found")
 }
 
 func classifyGit(ctx context.Context, workspaceRoot string, args []string) Action {
@@ -256,48 +371,23 @@ func classifyGitRead(ctx context.Context, repo, repoAbs, subcommand string, args
 	case "show":
 		return classifyGitShowRead(ctx, repo, repoAbs, args)
 	case "log":
-		showSignatures, err := gitReadSignaturesEnabled(ctx, repoAbs)
-		if err != nil {
-			return ineligible("cannot_resolve_git_log_signature_configuration")
-		}
-		if showSignatures {
-			return ineligible("git_log_signature_verification_not_supported")
-		}
-		hasOneline := false
+		return classifyGitLogRead(ctx, repo, repoAbs, args)
+	case "rev-parse":
+		return classifyGitRevParseRead(ctx, repo, repoAbs, args)
+	case "status":
 		for _, arg := range args {
-			switch {
-			case arg == "--oneline":
-				if hasOneline {
-					return ineligible("duplicate_git_log_option:--oneline")
-				}
-				hasOneline = true
-			case isShortNumericGitLogLimit(arg):
-				continue
-			case !strings.HasPrefix(arg, "-") && safeGitReadToken(arg):
-				continue
-			default:
-				return ineligible("unsupported_git_log_option_or_path:" + arg)
+			lower := strings.ToLower(strings.TrimSpace(arg))
+			if lower == "--ext-diff" || strings.HasPrefix(lower, "--ext-diff=") ||
+				lower == "--textconv" || strings.HasPrefix(lower, "--textconv=") ||
+				lower == "--no-index" || lower == "--output" || strings.HasPrefix(lower, "--output=") {
+				return ineligible("git_read_external_or_output_option:" + arg)
+			}
+			normalized := strings.ReplaceAll(arg, "\\", "/")
+			if filepath.IsAbs(arg) || len(normalized) >= 2 && normalized[1] == ':' ||
+				normalized == ".." || strings.HasPrefix(normalized, "../") || strings.Contains(normalized, "/../") {
+				return ineligible("git_read_path_outside_repository:" + arg)
 			}
 		}
-		if !hasOneline {
-			return ineligible("git_log_requires_explicit_--oneline")
-		}
-	}
-
-	for _, arg := range args {
-		lower := strings.ToLower(strings.TrimSpace(arg))
-		if lower == "--ext-diff" || strings.HasPrefix(lower, "--ext-diff=") ||
-			lower == "--textconv" || strings.HasPrefix(lower, "--textconv=") ||
-			lower == "--no-index" || lower == "--output" || strings.HasPrefix(lower, "--output=") {
-			return ineligible("git_read_external_or_output_option:" + arg)
-		}
-		normalized := strings.ReplaceAll(arg, "\\", "/")
-		if filepath.IsAbs(arg) || len(normalized) >= 2 && normalized[1] == ':' ||
-			normalized == ".." || strings.HasPrefix(normalized, "../") || strings.Contains(normalized, "/../") {
-			return ineligible("git_read_path_outside_repository:" + arg)
-		}
-	}
-	if subcommand == "status" {
 		usesExternalAttributes, err := repositoryUsesExternalAttributes(ctx, repoAbs, "")
 		if err != nil {
 			return ineligible("cannot_resolve_active_git_attributes")
@@ -305,8 +395,72 @@ func classifyGitRead(ctx context.Context, repo, repoAbs, subcommand string, args
 		if usesExternalAttributes {
 			return ineligible("git_status_external_filter_not_supported")
 		}
+		target, err := resolveGitReadTarget(ctx, repoAbs, "")
+		if err != nil {
+			return ineligible("cannot_resolve_git_status_target")
+		}
+		return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git status"}
+	default:
+		return ineligible("unsupported_git_read_subcommand:" + subcommand)
 	}
-	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Summary: "git " + subcommand}
+}
+
+func classifyGitLogRead(ctx context.Context, repo, repoAbs string, args []string) Action {
+	showSignatures, err := gitReadSignaturesEnabled(ctx, repoAbs)
+	if err != nil {
+		return ineligible("cannot_resolve_git_log_signature_configuration")
+	}
+	if showSignatures {
+		return ineligible("git_log_signature_verification_not_supported")
+	}
+	hasOneline := false
+	revision := ""
+	for _, arg := range args {
+		switch {
+		case arg == "--oneline":
+			if hasOneline {
+				return ineligible("duplicate_git_log_option:--oneline")
+			}
+			hasOneline = true
+		case isShortNumericGitLogLimit(arg):
+			continue
+		case !strings.HasPrefix(arg, "-") && safeGitReadToken(arg):
+			if revision != "" {
+				return ineligible("multiple_git_log_revisions_not_supported")
+			}
+			revision = arg
+		default:
+			return ineligible("unsupported_git_log_option_or_path:" + arg)
+		}
+	}
+	if !hasOneline {
+		return ineligible("git_log_requires_explicit_--oneline")
+	}
+	target, err := resolveGitReadTarget(ctx, repoAbs, revision)
+	if err != nil {
+		return ineligible("cannot_resolve_git_log_target")
+	}
+	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git log"}
+}
+
+func classifyGitRevParseRead(ctx context.Context, repo, repoAbs string, args []string) Action {
+	revision := ""
+	for _, arg := range args {
+		switch arg {
+		case "--show-toplevel", "--show-prefix", "--show-cdup", "--show-superproject-working-tree", "--is-inside-work-tree", "--is-bare-repository", "--absolute-git-dir", "--git-dir", "--git-common-dir":
+			continue
+		default:
+			if strings.HasPrefix(arg, "-") || revision != "" || !safeGitReadToken(arg) {
+				return ineligible("unsupported_git_rev_parse_argument:" + arg)
+			}
+			revision = arg
+		}
+	}
+	target, err := resolveGitReadTarget(ctx, repoAbs, revision)
+	if err != nil {
+		return ineligible("cannot_resolve_git_rev_parse_target")
+	}
+	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git rev-parse"}
 }
 
 func classifyGitDiffRead(ctx context.Context, repo, repoAbs string, args []string) Action {
@@ -367,7 +521,19 @@ func classifyGitDiffRead(ctx context.Context, repo, repoAbs string, args []strin
 	if usesExternalAttributes {
 		return ineligible("git_diff_external_filter_not_supported")
 	}
-	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Summary: "git diff"}
+	currentTarget, err := resolveGitReadTarget(ctx, repoAbs, "")
+	if err != nil {
+		return ineligible("cannot_resolve_git_diff_current_target")
+	}
+	targets := []string{currentTarget}
+	if revision != "" {
+		revisionTarget, targetErr := resolveGitReadTarget(ctx, repoAbs, revision)
+		if targetErr != nil {
+			return ineligible("cannot_resolve_git_diff_revision_target")
+		}
+		targets = append(targets, revisionTarget)
+	}
+	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: sortedUnique(targets), Summary: "git diff"}
 }
 
 func classifyGitShowRead(ctx context.Context, repo, repoAbs string, args []string) Action {
@@ -434,7 +600,11 @@ func classifyGitShowRead(ctx context.Context, repo, repoAbs string, args []strin
 	if usesExternalAttributes {
 		return ineligible("git_show_external_filter_not_supported")
 	}
-	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Summary: "git show"}
+	target, err := resolveGitReadTarget(ctx, repoAbs, object)
+	if err != nil {
+		return ineligible("cannot_resolve_git_show_target")
+	}
+	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git show"}
 }
 
 func gitReadSignaturesEnabled(ctx context.Context, repoAbs string) (bool, error) {
@@ -511,7 +681,7 @@ func classifyGitFetch(ctx context.Context, workspaceRoot, repo, repoAbs string, 
 		case "--refmap=":
 			emptyRefmap = true
 			continue
-		case "--quiet", "-q", "--verbose", "-v", "--progress", "--no-progress", "--no-write-fetch-head":
+		case "--quiet", "-q", "--verbose", "-v", "--progress", "--no-progress", "--no-write-fetch-head", "--recurse-submodules=no":
 			continue
 		case "--all", "--multiple", "--prune", "--prune-tags", "--tags", "--force", "-f", "--update-head-ok":
 			return ineligible("broad_or_mutating_git_fetch_option:" + arg)
@@ -699,6 +869,13 @@ func classifyGitCommit(ctx context.Context, workspaceRoot, repo, repoAbs string,
 	}
 	if strings.EqualFold(strings.TrimSpace(configuredSigning), "true") {
 		return ineligible("git_commit_automatic_signing_not_supported")
+	}
+	usesExternalAttributes, err := repositoryUsesExternalAttributes(ctx, repoAbs, "")
+	if err != nil {
+		return ineligible("cannot_resolve_git_commit_attributes")
+	}
+	if usesExternalAttributes {
+		return ineligible("git_commit_external_filter_not_supported")
 	}
 	branch, err := currentGitBranch(ctx, repoAbs)
 	if err != nil || branch == "HEAD" || !safeGitName(branch) {
@@ -1160,7 +1337,58 @@ func stagedGitPaths(ctx context.Context, workspaceRoot, repoAbs string) ([]strin
 
 func currentGitBranch(ctx context.Context, repoAbs string) (string, error) {
 	output, err := boundedGit(ctx, repoAbs, "rev-parse", "--abbrev-ref", "HEAD")
-	return strings.TrimSpace(output), err
+	if err == nil {
+		return strings.TrimSpace(output), nil
+	}
+	// An unborn branch has no HEAD object yet, but symbolic-ref still exposes
+	// the branch that status/add/commit operate on. Detached HEAD does not take
+	// this path because rev-parse succeeds with the literal HEAD marker.
+	output, symbolicErr := boundedGit(ctx, repoAbs, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if symbolicErr != nil {
+		return "", err
+	}
+	return strings.TrimSpace(output), nil
+}
+
+func resolveGitReadTarget(ctx context.Context, repoAbs, revision string) (string, error) {
+	revision = strings.TrimSpace(revision)
+	if revision == "" || revision == "HEAD" {
+		branch, err := currentGitBranch(ctx, repoAbs)
+		if err != nil || branch == "HEAD" || !safeGitName(branch) {
+			return "", errors.New("attached git branch required for grant-eligible read")
+		}
+		return "branch:" + branch, nil
+	}
+
+	branch := strings.TrimPrefix(revision, "refs/heads/")
+	if safeGitName(branch) && localGitBranchExists(ctx, repoAbs, branch) {
+		return "branch:" + branch, nil
+	}
+	if !isFullGitObjectID(revision) {
+		return "", errors.New("grant-eligible git read target must be a local branch, HEAD, or full object ID")
+	}
+	resolved, err := boundedGit(ctx, repoAbs, "rev-parse", "--verify", "--quiet", revision+"^{object}")
+	if err != nil {
+		return "", err
+	}
+	resolved = strings.TrimSpace(resolved)
+	if !isFullGitObjectID(resolved) {
+		return "", errors.New("git read object did not resolve to a full object ID")
+	}
+	return "object:" + strings.ToLower(resolved), nil
+}
+
+func isFullGitObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if character >= '0' && character <= '9' || character >= 'a' && character <= 'f' || character >= 'A' && character <= 'F' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func resolveGitRemote(ctx context.Context, workspaceRoot, repoAbs, remote string, forPush bool) (string, error) {
@@ -1190,6 +1418,11 @@ func resolveGitRemote(ctx context.Context, workspaceRoot, repoAbs, remote string
 		return "", configErr
 	} else if strings.TrimSpace(value) != "" {
 		return "", fmt.Errorf("remote.%s.%s command override is not grant eligible", remote, commandKey)
+	}
+	if value, configErr := boundedGitOptional(ctx, repoAbs, "config", "--get", "remote."+remote+".vcs"); configErr != nil {
+		return "", configErr
+	} else if strings.TrimSpace(value) != "" {
+		return "", fmt.Errorf("remote.%s.vcs helper override is not grant eligible", remote)
 	}
 	repository, err := canonicalRemoteRepository(workspaceRoot, repoAbs, urls[0])
 	if err != nil {
@@ -1235,16 +1468,39 @@ func canonicalRemoteRepository(workspaceRoot, repoAbs, remote string) (string, e
 	if strings.HasPrefix(lower, "git@github.com:") {
 		return NormalizeRepository("github:" + remote[len("git@github.com:"):])
 	}
-	if parsed, err := url.Parse(remote); err == nil && parsed.Host != "" {
-		if strings.EqualFold(parsed.Hostname(), "github.com") {
+	if strings.Contains(remote, "://") {
+		parsed, err := url.Parse(remote)
+		if err != nil {
+			return "", errors.New("invalid git remote URL")
+		}
+		scheme := strings.ToLower(parsed.Scheme)
+		switch scheme {
+		case "https":
+			if !strings.EqualFold(parsed.Hostname(), "github.com") || parsed.Port() != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+				return "", errors.New("grant-eligible HTTPS remotes must be canonical github.com URLs")
+			}
 			return NormalizeRepository("github:" + strings.TrimPrefix(parsed.Path, "/"))
-		}
-		if parsed.Scheme != "file" {
-			return "", errors.New("only GitHub or workspace-local remotes are grant eligible")
-		}
-		remote = parsed.Path
-		if runtime.GOOS == "windows" && len(remote) >= 3 && remote[0] == '/' && remote[2] == ':' {
-			remote = remote[1:]
+		case "ssh":
+			password := false
+			username := ""
+			if parsed.User != nil {
+				username = parsed.User.Username()
+				_, password = parsed.User.Password()
+			}
+			if !strings.EqualFold(parsed.Hostname(), "github.com") || parsed.Port() != "" || username != "git" || password || parsed.RawQuery != "" || parsed.Fragment != "" {
+				return "", errors.New("grant-eligible SSH remotes must use git@github.com without overrides")
+			}
+			return NormalizeRepository("github:" + strings.TrimPrefix(parsed.Path, "/"))
+		case "file":
+			if parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+				return "", errors.New("grant-eligible file remotes must be local paths without host, query, or fragment")
+			}
+			remote = parsed.Path
+			if runtime.GOOS == "windows" && len(remote) >= 3 && remote[0] == '/' && remote[2] == ':' {
+				remote = remote[1:]
+			}
+		default:
+			return "", errors.New("unsupported git remote protocol for grant reuse")
 		}
 	}
 	candidate := remote
@@ -1330,10 +1586,12 @@ func repositoryGrantSafety(ctx context.Context, workspaceRoot, repoAbs string) e
 			return fmt.Errorf("%s escapes workspace: %w", command.name, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(repoAbs, ".gitmodules")); err == nil {
+	hasSubmodules, err := repositoryHasSubmoduleState(ctx, repoAbs)
+	if err != nil {
+		return fmt.Errorf("inspect repository submodule state: %w", err)
+	}
+	if hasSubmodules {
 		return errors.New("repositories with submodules are not grant eligible")
-	} else if !os.IsNotExist(err) {
-		return err
 	}
 	if value, err := boundedGitOptional(ctx, repoAbs, "config", "--get", "core.hooksPath"); err != nil {
 		return err
@@ -1370,6 +1628,68 @@ func repositoryGrantSafety(ctx context.Context, workspaceRoot, repoAbs string) e
 		return fmt.Errorf("active git hook %q is not grant eligible", entry.Name())
 	}
 	return nil
+}
+
+func repositoryHasSubmoduleState(ctx context.Context, repoAbs string) (bool, error) {
+	bare, err := boundedGit(ctx, repoAbs, "rev-parse", "--is-bare-repository")
+	if err != nil {
+		return false, err
+	}
+	switch strings.ToLower(strings.TrimSpace(bare)) {
+	case "true":
+		return false, nil
+	case "false":
+		// Continue with worktree, index, tree, and effective configuration checks.
+	default:
+		return false, errors.New("cannot determine whether repository is bare")
+	}
+
+	if _, statErr := os.Stat(filepath.Join(repoAbs, ".gitmodules")); statErr == nil {
+		return true, nil
+	} else if !os.IsNotExist(statErr) {
+		return false, statErr
+	}
+	indexEntries, err := boundedGit(ctx, repoAbs, "ls-files", "--stage", "-z")
+	if err != nil {
+		return false, err
+	}
+	if hasGitlink, parseErr := gitMetadataHasGitlink(indexEntries); parseErr != nil || hasGitlink {
+		return hasGitlink, parseErr
+	}
+	head, err := boundedGitOptional(ctx, repoAbs, "rev-parse", "--verify", "--quiet", "HEAD")
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(head) != "" {
+		treeEntries, treeErr := boundedGit(ctx, repoAbs, "ls-tree", "-r", "-z", "HEAD")
+		if treeErr != nil {
+			return false, treeErr
+		}
+		if hasGitlink, parseErr := gitMetadataHasGitlink(treeEntries); parseErr != nil || hasGitlink {
+			return hasGitlink, parseErr
+		}
+	}
+	submoduleConfig, err := boundedGitOptional(ctx, repoAbs, "config", "--name-only", "--get-regexp", "^submodule\\..*\\.")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(submoduleConfig) != "", nil
+}
+
+func gitMetadataHasGitlink(output string) (bool, error) {
+	if len(output) > 4<<20 {
+		return false, errors.New("git metadata exceeds submodule inspection limit")
+	}
+	items := strings.Split(output, "\x00")
+	if len(items) > 20001 {
+		return false, errors.New("git metadata entry count exceeds submodule inspection limit")
+	}
+	for _, item := range items {
+		if strings.HasPrefix(item, "160000 ") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func repositoryUsesExternalAttributes(ctx context.Context, repoAbs, source string) (bool, error) {
