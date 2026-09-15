@@ -21,6 +21,7 @@ import (
 	"mcpx/internal/artifact"
 	"mcpx/internal/audit"
 	"mcpx/internal/auth"
+	"mcpx/internal/authorization"
 	"mcpx/internal/config"
 	"mcpx/internal/deletion"
 	"mcpx/internal/envelope"
@@ -57,6 +58,7 @@ type Runtime struct {
 	cfg             config.Config
 	reg             *workspace.Registry
 	approvals       *approval.Store
+	authorizations  *authorization.Store
 	audit           *audit.Logger
 	globalCfgPath   string
 	tasks           *terminal.TaskManager
@@ -199,6 +201,7 @@ func New(opts Options) (*Runtime, error) {
 		cfg:            cfg,
 		reg:            reg,
 		approvals:      approval.NewPersistentStore(stateStore.DB()),
+		authorizations: authorization.NewStore(stateStore.DB()),
 		audit:          logger,
 		globalCfgPath:  globalPath,
 		tasks:          taskManager,

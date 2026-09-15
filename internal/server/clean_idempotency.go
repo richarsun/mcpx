@@ -23,12 +23,29 @@ import (
 func cleanIdempotencyFingerprint(operation string, payload map[string]any) string {
 	canonical := make(map[string]any, len(payload)+1)
 	canonical["operation"] = operation
+	authorizationScoped := false
+	for _, key := range []string{"authorization_context_id", "authorization_grant_id", "authorization_request"} {
+		if _, ok := payload[key]; ok {
+			authorizationScoped = true
+			break
+		}
+	}
 	for key, value := range payload {
 		switch key {
 		case "idempotency_key", "user_confirmed", "confirmation_key", "confirmation_token", "client_request_id",
-			"request_id", "purpose", "intent", "progress_summary", "execution_mode":
-			// These fields are retry/auth/audit metadata, not the effect itself.
+			"request_id", "progress_summary", "execution_mode":
+			// These fields are retry or transport metadata, not the effect itself.
+		case "purpose", "intent":
+			// Purpose is ordinarily audit metadata, but it is a security boundary
+			// for a conversation authorization grant. A changed purpose must conflict
+			// instead of replaying an effect authorized for another work package.
+			if authorizationScoped {
+				canonical[key] = value
+			}
 		default:
+			// Authorization context, grant, and request are intentionally retained:
+			// they are security boundaries, so a key from a different conversation
+			// or grant must conflict rather than replay an older authorized result.
 			canonical[key] = value
 		}
 	}
@@ -92,6 +109,18 @@ func decodeCleanToolResult(operation string, encoded []byte, replay bool) (*mcp.
 	result := mcpresult.NewStructured(structured, stored.Text)
 	result.IsError = stored.IsError
 	return result, nil
+}
+
+func cleanResultNeedsConfirmation(result *mcp.CallToolResult) bool {
+	if result == nil {
+		return false
+	}
+	wire, ok := result.StructuredContent.(map[string]any)
+	if !ok {
+		return false
+	}
+	status, _ := wire["status"].(string)
+	return status == string(envelope.StatusNeedConfirmation)
 }
 
 func markCleanReplay(value any) {
@@ -213,6 +242,10 @@ func (r *Runtime) withCleanIdempotency(
 	}
 
 	result, callErr := handler(ctx, req)
+	if cleanResultNeedsConfirmation(result) {
+		_ = r.idempotency.Abandon(ctx, key, fingerprint)
+		return result, callErr
+	}
 	if result == nil {
 		_ = r.idempotency.MarkInDoubt(ctx, key, fingerprint, nil)
 		return r.cleanIdempotencyFailure(envReq, session, operation, payload, "IDEMPOTENCY_IN_DOUBT", "handler returned no durable result; reconcile before retrying"), callErr
