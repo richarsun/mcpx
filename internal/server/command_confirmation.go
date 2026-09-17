@@ -11,6 +11,7 @@ import (
 	"mcpx/internal/audit"
 	"mcpx/internal/auth"
 	"mcpx/internal/envelope"
+	"mcpx/internal/mcpresult"
 	"mcpx/internal/remotesession"
 	"mcpx/internal/security"
 )
@@ -19,6 +20,7 @@ type approvedCommandExecutor func(context.Context, time.Duration) (*mcp.CallTool
 
 func (r *Runtime) executeWithCommandConfirmation(
 	ctx context.Context,
+	req *mcp.CallToolRequest,
 	envReq envelope.Request,
 	principal auth.Principal,
 	remote remotesession.Session,
@@ -38,7 +40,7 @@ func (r *Runtime) executeWithCommandConfirmation(
 	}
 	if isCleanCoreRequest(ctx) {
 		return r.executeCleanCommandConfirmation(
-			ctx, envReq, principal, remote, command, purpose, scope, commandDigest,
+			ctx, req, envReq, principal, remote, command, purpose, scope, commandDigest,
 			analysis, runtimeSpec, yield, authorizationState, executeApproved,
 		)
 	}
@@ -50,6 +52,7 @@ func (r *Runtime) executeWithCommandConfirmation(
 
 func (r *Runtime) executeCleanCommandConfirmation(
 	ctx context.Context,
+	req *mcp.CallToolRequest,
 	envReq envelope.Request,
 	principal auth.Principal,
 	remote remotesession.Session,
@@ -111,18 +114,17 @@ func (r *Runtime) executeCleanCommandConfirmation(
 			"命令执行等待用户语义确认",
 		)
 		response.RemoteSessionID = remote.ID
-		retryArguments := map[string]any{
-			"remote_session_id": remote.ID, "action": "run", "command": command,
-			"purpose": purpose, "scope": scope, "user_confirmed": true,
-		}
 		if runtimeSpec != nil {
-			retryArguments = runtimeConfirmationRetryArguments(remote.ID, purpose, scope, runtimeSpec)
+			confirmationData["summary"] = "临时脚本等待用户确认；服务端不保存脚本正文，也不提供可直接执行的重试模板。调用方须回读已保存的完整原始请求与脚本，核对 script_sha256、script_bytes、Workspace 身份并保留全部业务参数、remote_session_id 和 idempotency_key；获准后仅将 user_confirmed 改为 true。原始请求缺失或校验失败时停止，不得重建等价脚本或换 key 重跑。"
+			return r.resultJSON(response)
 		}
-		addCommandAuthorizationRetryArguments(retryArguments, authorizationState)
+		// 原样保留调用参数、授权边界、Activity 与幂等身份，避免恢复模板改变请求指纹。
+		retryArguments := mcpresult.Arguments(req)
+		retryArguments["user_confirmed"] = true
 		addRecoveryAction(
 			&response,
 			"execute",
-			"用户确认后使用相同 command/task 或 runtime+script、purpose、authorization 边界和 remote_session_id 重试，并设置 user_confirmed=true",
+			"用户确认后保留完整原始请求及 idempotency_key，仅设置 user_confirmed=true；重试不得换 key 或改写参数",
 			retryArguments,
 		)
 		return r.resultJSON(response)

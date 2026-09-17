@@ -18,6 +18,7 @@ import (
 	"mcpx/internal/auth"
 	"mcpx/internal/config"
 	"mcpx/internal/envelope"
+	"mcpx/internal/environment"
 	workspacefile "mcpx/internal/file"
 	"mcpx/internal/projecttask"
 	"mcpx/internal/remotesession"
@@ -48,7 +49,20 @@ func (r *Runtime) toolCommandExecute(ctx context.Context, req *mcp.CallToolReque
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", "runtime+script is available only through clean-core execute")
 	}
 	command := strings.TrimSpace(stringPayload(envReq.Payload, "command"))
+	argvSpec, argvDisplay, argvDigest, argvErr := executeArgv(envReq.Payload)
+	if argvErr != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", argvErr.Error())
+	}
+	if argvSpec != nil {
+		if !isCleanCoreRequest(ctx) {
+			return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", "argv is available through execute")
+		}
+		command = argvDisplay
+	}
 	taskName := strings.TrimSpace(stringPayload(envReq.Payload, "task"))
+	if _, _, err := r.expectedExecutionWorkspace(ctx, remote.ID, remote.WorkspacePath, envReq.Payload); err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "WORKSPACE_IDENTITY_MISMATCH", err.Error())
+	}
 	if runtimeSpec != nil {
 		command = runtimeSpec.Command
 	} else if taskName != "" {
@@ -64,7 +78,7 @@ func (r *Runtime) toolCommandExecute(ctx context.Context, req *mcp.CallToolReque
 	if command == "" {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", "command, task, or runtime+script is required")
 	}
-	payloadDigest := ""
+	payloadDigest := argvDigest
 	if runtimeSpec != nil {
 		payloadDigest = runtimeSpec.ScriptSHA256
 	}
@@ -151,7 +165,7 @@ func (r *Runtime) toolCommandExecute(ctx context.Context, req *mcp.CallToolReque
 		return r.executeRuntimeTask(executionCtx, envReq, principal, remote, runtimeSpec, purpose, scope, commandDigest, analysis)
 	}
 	return r.executeWithCommandConfirmation(
-		ctx, envReq, principal, remote,
+		ctx, req, envReq, principal, remote,
 		command, purpose, scope, commandDigest,
 		analysis, runtimeSpec, yieldForRequest,
 		authorizationState, executeApproved,
@@ -187,8 +201,24 @@ func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Reques
 	if originTool == "" {
 		originTool = "command_execute"
 	}
+	argvSpec, _, _, err := executeArgv(envReq.Payload)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "bad_request", err.Error())
+	}
+	workDir, expected, err := r.expectedExecutionWorkspace(ctx, remote.ID, remote.WorkspacePath, envReq.Payload)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "WORKSPACE_IDENTITY_MISMATCH", err.Error())
+	}
+	planned, err := validateWorkspaceTransition(ctx, envReq.Payload, expected)
+	if err != nil {
+		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "WORKSPACE_TRANSITION_INVALID", err.Error())
+	}
+	if planned != nil {
+		if err := r.prepareWorkspaceTransition(ctx, remote.ID, command, *expected, *planned); err != nil {
+			return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "WORKSPACE_TRANSITION_UNVERIFIED", err.Error())
+		}
+	}
 	var task *terminal.Task
-	var err error
 	if authorizationState, ok := commandAuthorizationFromContext(ctx); ok && authorizationState.matchedGrant() {
 		if strings.TrimSpace(authorizationState.Action.Executable) == "" {
 			return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "start_error", "grant-backed command has no pinned executable")
@@ -199,7 +229,7 @@ func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Reques
 			originTool,
 			remote.ID,
 			remote.WorkspaceName,
-			remote.WorkspacePath,
+			workDir,
 			command,
 			terminal.ProcessSpec{
 				Executable: authorizationState.Action.Executable,
@@ -207,11 +237,18 @@ func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Reques
 				Env:        append([]string(nil), authorizationState.Action.Environment...),
 			},
 		)
+	} else if argvSpec != nil {
+		task, err = r.tasks.StartRemoteProcessWithObservationContext(envReq.RequestID, observationCallID(envReq), originTool, remote.ID, remote.WorkspaceName, workDir, command, *argvSpec)
 	} else {
-		task, err = r.tasks.StartRemoteWithObservationContext(ctx, envReq.RequestID, observationCallID(envReq), originTool, remote.ID, remote.WorkspaceName, remote.WorkspacePath, command)
+		task, err = r.tasks.StartRemoteWithObservationContext(ctx, envReq.RequestID, observationCallID(envReq), originTool, remote.ID, remote.WorkspaceName, workDir, command)
 	}
 	if err != nil {
 		return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "start_error", err.Error())
+	}
+	if planned != nil {
+		if _, err := r.state.DB().ExecContext(context.WithoutCancel(ctx), `UPDATE workspace_identity_transitions SET task_id=? WHERE run_id=? AND operation_id=? AND task_id=''`, task.ID, expected.RunID, planned.OperationID); err != nil {
+			return r.terminalError(envReq, remote.ID, remote.WorkspaceName, "WORKSPACE_TRANSITION_UNVERIFIED", "task started but transition receipt could not be persisted; do not replay")
+		}
 	}
 	_ = r.remote.AddEvent(ctx, principal, remotesession.Event{RemoteSessionID: remote.ID, Type: "command.started", OperationID: task.ID, Summary: command, Metadata: commandExecutionDetailWithAuthorization(ctx, purpose, scope, commandDigest, analysis)})
 	waitCtx, cancel := context.WithTimeout(ctx, yield)
@@ -223,8 +260,32 @@ func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Reques
 	data["command_digest"] = commandDigest
 	data["command_policy"] = commandPolicyData(analysis)
 	data["command"] = command
+	if argvSpec != nil {
+		data["argv"] = envReq.Payload["argv"]
+		data["shell"] = false
+	}
 	data["working_directory"] = remote.WorkspacePath
+	if expected != nil {
+		data["working_directory"] = workDir
+		data["workspace_pre_identity"] = expected
+		data["run_id"] = expected.RunID
+	}
 	data["workspace_scoped"] = scope == "workspace"
+	if planned != nil {
+		data["workspace_transition_operation_id"] = planned.OperationID
+		data["workspace_transition_state"] = "pending"
+		if completed && data["exit_code"] == 0 {
+			if err := r.reconcileWorkspaceTransition(context.WithoutCancel(ctx), remote.ID, expected.RunID); err != nil {
+				response := envelope.Fail(envelope.StatusError, envReq.RequestID, remote.WorkspaceName, data, "workspace_transition_unverified", err.Error())
+				response.RemoteSessionID = remote.ID
+				return r.resultJSON(response)
+			}
+			after := *expected
+			after.HEAD, after.Tree = planned.HEAD, planned.Tree
+			data["workspace_post_identity"] = after
+			data["workspace_transition_state"] = "confirmed"
+		}
+	}
 	addCommandAuthorizationData(ctx, data)
 	capTaskExecutionOutput(data, config.MaxResultBytes(r.cfg.Limits))
 	if completed {
@@ -434,7 +495,8 @@ func ephemeralRuntimeSpecFromPayload(payload map[string]any) (*ephemeralRuntimeS
 		if database != "" {
 			return nil, fmt.Errorf("database is supported only by sqlite runtime")
 		}
-		spec.Executable, spec.Args, spec.Command = "python3", []string{"-"}, "python3 -"
+		spec.Executable = environment.PythonExecutable()
+		spec.Args, spec.Command = []string{"-"}, spec.Executable+" -"
 	case "node":
 		if database != "" {
 			return nil, fmt.Errorf("database is supported only by sqlite runtime")
@@ -498,22 +560,6 @@ func addRuntimeConfirmationData(data map[string]any, spec *ephemeralRuntimeSpec)
 	}
 	data["wall_limit_ms"] = ephemeralRuntimeWallLimit.Milliseconds()
 	data["cpu_time_limit_ms"] = ephemeralRuntimeCPUTimeLimit.Milliseconds()
-}
-
-func runtimeConfirmationRetryArguments(remoteID, purpose, scope string, spec *ephemeralRuntimeSpec) map[string]any {
-	arguments := map[string]any{
-		"remote_session_id": remoteID,
-		"action":            "run",
-		"runtime":           spec.Runtime,
-		"purpose":           purpose,
-		"scope":             scope,
-		"user_confirmed":    true,
-		"note":              "reuse the exact original script; confirmation is bound to its SHA-256 and script source is not persisted",
-	}
-	if spec.Runtime == "sqlite" {
-		arguments["database"] = spec.Database
-	}
-	return arguments
 }
 
 func normalizeSQLiteDatabasePath(workspaceRoot, database string) (string, error) {

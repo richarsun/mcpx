@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -749,11 +750,15 @@ func TestExecutionOutcomeClassification(t *testing.T) {
 }
 
 func TestEphemeralPythonRuntimeExecutesAndKeepsReadableTaskID(t *testing.T) {
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 unavailable")
+	python := "python3"
+	if runtime.GOOS == "windows" {
+		python = "python"
+	}
+	if _, err := exec.LookPath(python); err != nil {
+		t.Skip("Python unavailable")
 	}
 	rt := newWorkspaceRuntime(t, "demo")
-	rt.cfg.Security.Commands.Allow = append(rt.cfg.Security.Commands.Allow, `^python3 -$`)
+	rt.cfg.Security.Commands.Allow = append(rt.cfg.Security.Commands.Allow, "^"+python+" -$")
 	opened := callEnvelope(t, rt.toolSession, context.Background(), map[string]any{"action": "open", "workspace": "demo"})
 	remoteID := opened["remote_session_id"].(string)
 	result := callEnvelope(t, rt.toolExecute, context.Background(), map[string]any{
@@ -764,6 +769,9 @@ func TestEphemeralPythonRuntimeExecutesAndKeepsReadableTaskID(t *testing.T) {
 		t.Fatalf("runtime result=%+v", result)
 	}
 	data := result["data"].(map[string]any)
+	if data["command"] != python+" -" || data["exit_code"] != float64(0) {
+		t.Fatalf("Python 实际启动命令或退出状态不正确: %+v", data)
+	}
 	taskID, _ := data["execution_task_id"].(string)
 	if taskID == "" || data["runtime"] != "python" || data["completed_in_call"] != true {
 		t.Fatalf("runtime metadata=%+v", data)
