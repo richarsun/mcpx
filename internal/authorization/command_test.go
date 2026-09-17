@@ -50,7 +50,7 @@ func TestClassifyBoundedGitWorkPackage(t *testing.T) {
 		},
 		{
 			name:       "read show",
-			command:    "git -C repo show --no-ext-diff --no-textconv --oneline --stat HEAD",
+			command:    "git -C repo show --no-ext-diff --no-textconv --oneline --stat refs/heads/feat/issue-861",
 			class:      "git_read",
 			repository: "workspace:repo",
 		},
@@ -304,7 +304,7 @@ func TestClassifierRejectsGitReadExternalExecutionSurfaces(t *testing.T) {
 	runGit(t, repo, "config", "log.showSignature", "true")
 	for _, command := range []string{
 		"git -C repo log -1 --oneline",
-		"git -C repo show --no-ext-diff --no-textconv --oneline --stat HEAD",
+		"git -C repo show --no-ext-diff --no-textconv --oneline --stat refs/heads/feat/issue-861",
 	} {
 		action := ClassifyCommand(ctx, workspace, []string{command})
 		if action.Eligible {
@@ -316,7 +316,7 @@ func TestClassifierRejectsGitReadExternalExecutionSurfaces(t *testing.T) {
 	runGit(t, repo, "config", "format.pretty", "format:%G?")
 	for _, command := range []string{
 		"git -C repo log -1 --oneline",
-		"git -C repo show --no-ext-diff --no-textconv --oneline --stat HEAD",
+		"git -C repo show --no-ext-diff --no-textconv --oneline --stat refs/heads/feat/issue-861",
 	} {
 		action := ClassifyCommand(ctx, workspace, []string{command})
 		if !action.Eligible {
@@ -328,7 +328,7 @@ func TestClassifierRejectsGitReadExternalExecutionSurfaces(t *testing.T) {
 	writeFile(t, filepath.Join(repo, ".gitattributes"), "docs/allowed.md diff=issue861\n")
 	runGit(t, repo, "add", "--", ".gitattributes")
 	runGit(t, repo, "commit", "-m", "activate show textconv")
-	action := ClassifyCommand(ctx, workspace, []string{"git -C repo show --no-ext-diff --no-textconv --oneline --stat HEAD"})
+	action := ClassifyCommand(ctx, workspace, []string{"git -C repo show --no-ext-diff --no-textconv --oneline --stat refs/heads/feat/issue-861"})
 	if action.Eligible {
 		t.Fatalf("show with active external diff attributes became grant eligible: %+v", action)
 	}
@@ -680,12 +680,57 @@ func TestClassifierRejectsAmbiguousGitRemoteTransportForms(t *testing.T) {
 	}
 
 	for _, path := range []string{`C:\repo`, "C:/repo"} {
-		if hasAmbiguousGitScpSyntax(path) {
+		ambiguous := hasAmbiguousGitScpSyntax(path)
+		if runtime.GOOS == "windows" && ambiguous {
 			t.Fatalf("Windows absolute drive path was misclassified as scp syntax: %q", path)
+		}
+		if runtime.GOOS != "windows" && !ambiguous {
+			t.Fatalf("POSIX drive-lookalike remote must remain scp-like and fail-closed: %q", path)
 		}
 	}
 	if !hasAmbiguousGitScpSyntax("C:repo") {
-		t.Fatal("Windows drive-relative path must remain fail-closed as ambiguous")
+		t.Fatal("drive-relative/scp-like path must remain fail-closed as ambiguous")
+	}
+}
+
+func TestClassifierRejectsPOSIXDriveLookalikeRemoteBeforeSSHSideEffect(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX-specific drive-lookalike transport test")
+	}
+	workspace, repo := newGitFixture(t)
+	ctx := withGrantTestExecutables(t, context.Background())
+	remoteURL := "C:/repo"
+	lookalike := filepath.Join(repo, filepath.FromSlash(remoteURL))
+	if err := os.MkdirAll(filepath.Dir(lookalike), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("git", "init", "--bare", lookalike)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create POSIX drive-lookalike bare repository: %v\n%s", err, output)
+	}
+	runGit(t, repo, "remote", "set-url", "origin", remoteURL)
+
+	markerDir := t.TempDir()
+	marker := filepath.Join(markerDir, "ssh-marker")
+	helper := filepath.Join(markerDir, "ssh-marker-helper")
+	writeFile(t, helper, "#!/bin/sh\nprintf invoked > '"+marker+"'\nexit 1\n")
+	if err := os.Chmod(helper, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_SSH_COMMAND", helper)
+
+	for _, gitCommand := range []string{
+		"git -C repo fetch --no-tags --refmap= origin main",
+		"git -C repo push origin feat/issue-861",
+	} {
+		action := ClassifyCommand(ctx, workspace, []string{gitCommand})
+		if action.Eligible {
+			t.Fatalf("POSIX C:/repo drive-lookalike became grant eligible: %s => %+v", gitCommand, action)
+		}
+		assertContains(t, action.Reasons, "segment_1:unresolved_git_remote:origin")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("SSH marker executed before POSIX drive-lookalike remote was rejected: %v", err)
 	}
 }
 
@@ -736,17 +781,139 @@ func TestClassifierRejectsGitExecPathBeforeGitProbe(t *testing.T) {
 	}
 }
 
-func TestClassifierRejectsUntrustedCredentialHelperAcrossConfigScopes(t *testing.T) {
+func TestClassifierAcceptsCanonicalGitHubHTTPSRemote(t *testing.T) {
 	workspace, repo := newGitFixture(t)
 	ctx := withGrantTestExecutables(t, context.Background())
+	// Isolate user/global config while preserving the platform system Git config.
+	t.Setenv("HOME", t.TempDir())
 	runGit(t, repo, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
-	runGit(t, repo, "config", "credential.helper", "!external-helper")
 
-	action := ClassifyCommand(ctx, workspace, []string{"git -C repo fetch --no-tags --refmap= origin main"})
-	if action.Eligible {
-		t.Fatalf("untrusted credential helper became grant eligible: %+v", action)
+	for _, command := range []string{
+		"git -C repo fetch --no-tags --refmap= origin main",
+		"git -C repo push origin feat/issue-861",
+	} {
+		action := ClassifyCommand(ctx, workspace, []string{command})
+		if !action.Eligible {
+			t.Fatalf("canonical GitHub HTTPS remote became grant-ineligible: %s => %+v", command, action)
+		}
+		assertContains(t, action.Repositories, "github:owner/repo")
 	}
-	assertContains(t, action.Reasons, "segment_1:unresolved_git_remote:origin")
+}
+
+func TestClassifierRejectsUntrustedCredentialHelperAcrossConfigScopes(t *testing.T) {
+	classifyFetch := func(t *testing.T, configure func(string, string)) Action {
+		t.Helper()
+		workspace, repo := newGitFixture(t)
+		ctx := withGrantTestExecutables(t, context.Background())
+		runGit(t, repo, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
+		if configure != nil {
+			configure(workspace, repo)
+		}
+		return ClassifyCommand(ctx, workspace, []string{"git -C repo fetch --no-tags --refmap= origin main"})
+	}
+
+	t.Run("repository shell helper", func(t *testing.T) {
+		action := classifyFetch(t, func(_, repo string) {
+			runGit(t, repo, "config", "credential.helper", "!external-helper")
+		})
+		if action.Eligible {
+			t.Fatalf("untrusted credential helper became grant eligible: %+v", action)
+		}
+		assertContains(t, action.Reasons, "segment_1:unresolved_git_remote:origin")
+	})
+
+	for _, test := range []struct {
+		name  string
+		value string
+	}{
+		{name: "url shell helper", value: "!url-helper"},
+		{name: "url empty reset", value: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			action := classifyFetch(t, func(_, repo string) {
+				runGit(t, repo, "config", "credential.https://github.com.helper", test.value)
+			})
+			if action.Eligible {
+				t.Fatalf("URL-scoped credential helper/reset became grant eligible: %+v", action)
+			}
+			assertContains(t, action.Reasons, "segment_1:unresolved_git_remote:origin")
+		})
+	}
+
+	t.Run("global url helper", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		action := classifyFetch(t, func(_, repo string) {
+			runGit(t, repo, "config", "--global", "credential.https://github.com.helper", "!global-helper")
+		})
+		if action.Eligible {
+			t.Fatalf("global URL-scoped credential helper became grant eligible: %+v", action)
+		}
+	})
+
+	t.Run("multiple helpers", func(t *testing.T) {
+		action := classifyFetch(t, func(_, repo string) {
+			runGit(t, repo, "config", "--add", "credential.helper", "!first-helper")
+			runGit(t, repo, "config", "--add", "credential.helper", "!second-helper")
+		})
+		if action.Eligible {
+			t.Fatalf("multiple credential helpers became grant eligible: %+v", action)
+		}
+	})
+
+	t.Run("absolute custom helper", func(t *testing.T) {
+		helper := filepath.Join(t.TempDir(), "credential-helper")
+		writeFile(t, helper, "not executable by grant\n")
+		action := classifyFetch(t, func(_, repo string) {
+			runGit(t, repo, "config", "credential.helper", helper)
+		})
+		if action.Eligible {
+			t.Fatalf("absolute credential helper became grant eligible: %+v", action)
+		}
+	})
+
+	t.Run("git config environment injection", func(t *testing.T) {
+		t.Setenv("GIT_CONFIG_COUNT", "1")
+		t.Setenv("GIT_CONFIG_KEY_0", "credential.helper")
+		t.Setenv("GIT_CONFIG_VALUE_0", "!injected-helper")
+		action := classifyFetch(t, nil)
+		if action.Eligible {
+			t.Fatalf("GIT_CONFIG_* injection became grant eligible: %+v", action)
+		}
+		assertContains(t, action.Reasons, "segment_1:unsafe_grant_execution_environment:GIT_CONFIG_COUNT_not_supported")
+	})
+}
+
+func TestClassifierRejectsAllSSHRemotesBeforeSSHConfigExecution(t *testing.T) {
+	for _, remoteURL := range []string{"git@github.com:owner/repo.git", "ssh://git@github.com/owner/repo.git"} {
+		t.Run(remoteURL, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			marker := filepath.Join(home, "ssh-config-marker")
+			sshDir := filepath.Join(home, ".ssh")
+			if err := os.MkdirAll(sshDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, filepath.Join(sshDir, "config"), "Host github.com\n    ProxyCommand marker-helper "+marker+"\n    Match exec marker-helper\n")
+
+			workspace, repo := newGitFixture(t)
+			ctx := withGrantTestExecutables(t, context.Background())
+			runGit(t, repo, "remote", "set-url", "origin", remoteURL)
+			for _, command := range []string{
+				"git -C repo fetch --no-tags --refmap= origin main",
+				"git -C repo push origin feat/issue-861",
+			} {
+				action := ClassifyCommand(ctx, workspace, []string{command})
+				if action.Eligible {
+					t.Fatalf("SSH/scp remote became grant eligible: %s => %+v", command, action)
+				}
+				assertContains(t, action.Reasons, "segment_1:unresolved_git_remote:origin")
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("SSH config marker was triggered through grant classification: %v", err)
+			}
+		})
+	}
 }
 
 func TestClassifierRejectsNetworkGitCommandOverrides(t *testing.T) {
@@ -926,9 +1093,7 @@ func TestClassifierIncludesBothSidesOfStagedRename(t *testing.T) {
 
 func TestClassifierRejectsOnlyActiveFilterCommands(t *testing.T) {
 	workspace, repo := newGitFixture(t)
-	t.Setenv("GIT_CONFIG_COUNT", "1")
-	t.Setenv("GIT_CONFIG_KEY_0", "filter.issue861.process")
-	t.Setenv("GIT_CONFIG_VALUE_0", "external-helper")
+	runGit(t, repo, "config", "filter.issue861.process", "external-helper")
 
 	unused := ClassifyCommand(context.Background(), workspace, []string{"git -C repo status --short"})
 	if !unused.Eligible {
@@ -944,9 +1109,7 @@ func TestClassifierRejectsOnlyActiveFilterCommands(t *testing.T) {
 
 func TestClassifierRejectsSwitchToBranchWithActiveFilter(t *testing.T) {
 	workspace, repo := newGitFixture(t)
-	t.Setenv("GIT_CONFIG_COUNT", "1")
-	t.Setenv("GIT_CONFIG_KEY_0", "filter.issue861.process")
-	t.Setenv("GIT_CONFIG_VALUE_0", "external-helper")
+	runGit(t, repo, "config", "filter.issue861.process", "external-helper")
 
 	runGit(t, repo, "switch", "-c", "filtered-target")
 	writeFile(t, filepath.Join(repo, ".gitattributes"), "docs/allowed.md filter=issue861\n")
@@ -990,17 +1153,32 @@ func TestResolveGrantExecutableRejectsWorkspaceExternalPATHShadowBeforeProbe(t *
 func TestGitReadTargetsRespectGrantAndNarrowing(t *testing.T) {
 	workspace, repo := newGitFixture(t)
 	ctx := withGrantTestExecutables(t, context.Background())
-	commands := []string{
+
+	explicitCommands := []string{
+		"git -C repo log --oneline refs/heads/main",
+		"git -C repo diff --no-ext-diff --no-textconv refs/heads/main",
+		"git -C repo show --no-ext-diff --no-textconv --oneline --stat refs/heads/main",
+		"git -C repo rev-parse refs/heads/main",
+	}
+	for _, command := range explicitCommands {
+		action := ClassifyCommand(ctx, workspace, []string{command})
+		if !action.Eligible {
+			t.Fatalf("explicit canonical Git read target was not classifiable: %s => %+v", command, action)
+		}
+		assertContains(t, action.Targets, "branch:main")
+		assertContains(t, action.Arguments, "refs/heads/main")
+	}
+
+	for _, command := range []string{
 		"git -C repo log --oneline main",
 		"git -C repo diff --no-ext-diff --no-textconv main",
 		"git -C repo show --no-ext-diff --no-textconv --oneline --stat main",
-	}
-	for _, command := range commands {
+		"git -C repo rev-parse main",
+	} {
 		action := ClassifyCommand(ctx, workspace, []string{command})
-		if !action.Eligible {
-			t.Fatalf("explicit Git read target was not classifiable: %s => %+v", command, action)
+		if action.Eligible {
+			t.Fatalf("bare symbolic revision must fall back to ordinary confirmation: %s => %+v", command, action)
 		}
-		assertContains(t, action.Targets, "branch:main")
 	}
 
 	runGit(t, repo, "switch", "main")
@@ -1015,12 +1193,46 @@ func TestGitReadTargetsRespectGrantAndNarrowing(t *testing.T) {
 	}
 	assertContains(t, plainBranchRead.Reasons, "segment_1:plain_git_branch_read_not_grant_eligible")
 
+	mainOID := gitOutput(t, repo, "rev-parse", "refs/heads/main")
+	runGit(t, repo, "switch", "-c", "ambiguity-fixture")
+	writeFile(t, filepath.Join(repo, "feature-only.txt"), "feature\n")
+	runGit(t, repo, "add", "--", "feature-only.txt")
+	runGit(t, repo, "commit", "-m", "feature target")
+	featureHead := gitOutput(t, repo, "rev-parse", "HEAD")
+	if featureHead == mainOID {
+		t.Fatal("ambiguity fixture requires distinct branch/tag objects")
+	}
+	runGit(t, repo, "tag", "-f", "main", featureHead)
+	runGit(t, repo, "update-ref", "refs/heads/"+mainOID, featureHead)
+
+	bareMain := ClassifyCommand(ctx, workspace, []string{"git -C repo log --oneline main"})
+	if bareMain.Eligible {
+		t.Fatalf("branch/tag ambiguous bare revision became grant eligible: %+v", bareMain)
+	}
+
+	for _, command := range []string{
+		"git -C repo log --oneline " + mainOID,
+		"git -C repo diff --no-ext-diff --no-textconv " + mainOID,
+		"git -C repo show --no-ext-diff --no-textconv --oneline --stat " + mainOID,
+		"git -C repo rev-parse " + mainOID,
+	} {
+		action := ClassifyCommand(ctx, workspace, []string{command})
+		if !action.Eligible {
+			t.Fatalf("verified full object ID was not classifiable: %s => %+v", command, action)
+		}
+		assertContains(t, action.Targets, "object:"+strings.ToLower(mainOID))
+		assertContains(t, action.Arguments, strings.ToLower(mainOID))
+		if stringSliceContains(action.Targets, "branch:"+mainOID) {
+			t.Fatalf("full OID was misclassified as same-named branch: %+v", action)
+		}
+	}
+
 	now := time.Date(2026, 9, 15, 8, 0, 0, 0, time.UTC)
 	wideScope, err := NormalizeScope(Scope{
 		PurposePatterns: []string{"issue 861*"},
 		ActionClasses:   []string{"git_read"},
 		Repositories:    []string{"workspace:repo"},
-		Targets:         []string{"branch:main", "branch:feat/*"},
+		Targets:         []string{"branch:main", "branch:feat/*", "object:" + strings.ToLower(mainOID)},
 		RiskCeiling:     RiskOrdinary,
 	})
 	if err != nil {
@@ -1039,7 +1251,7 @@ func TestGitReadTargetsRespectGrantAndNarrowing(t *testing.T) {
 	if changed, err := IsStrictSubset(narrowScope, wideScope); err != nil || !changed {
 		t.Fatalf("expected target removal to be a valid narrow operation: changed=%v err=%v", changed, err)
 	}
-	mainRead := ClassifyCommand(ctx, workspace, []string{"git -C repo log --oneline main"})
+	mainRead := ClassifyCommand(ctx, workspace, []string{"git -C repo log --oneline refs/heads/main"})
 	if match := Match(Grant{Status: StatusActive, Scope: wideScope, ExpiresAt: now.Add(time.Hour)}, "issue 861 implementation", mainRead, now); !match.Matched {
 		t.Fatalf("main read should match before narrowing: %+v", match)
 	}
@@ -1048,6 +1260,10 @@ func TestGitReadTargetsRespectGrantAndNarrowing(t *testing.T) {
 		t.Fatalf("read of removed branch target matched after narrowing: %+v", match)
 	}
 	assertContains(t, match.Reasons, "target_out_of_scope:branch:main")
+	objectRead := ClassifyCommand(ctx, workspace, []string{"git -C repo show --no-ext-diff --no-textconv --oneline --stat " + mainOID})
+	if match := Match(Grant{Status: StatusActive, Scope: narrowScope, ExpiresAt: now.Add(time.Hour)}, "issue 861 implementation", objectRead, now); match.Matched {
+		t.Fatalf("full OID alias recovered a removed target after narrowing: %+v", match)
+	}
 	if match := Match(Grant{Status: StatusActive, Scope: wideScope, ExpiresAt: now.Add(time.Hour)}, "issue 861 implementation", currentBranchRead, now); !match.Matched {
 		t.Fatalf("current main branch read should match before narrowing: %+v", match)
 	}

@@ -73,6 +73,13 @@ func frozenGrantExecutionEnvironment(executable, executablePath string) ([]strin
 		if value, present := environmentValue(environment, "GIT_EXEC_PATH"); present && strings.TrimSpace(value) != "" {
 			return nil, errors.New("GIT_EXEC_PATH_not_supported")
 		}
+		for _, entry := range environment {
+			name, _, ok := strings.Cut(entry, "=")
+			name = strings.TrimSpace(name)
+			if ok && strings.HasPrefix(strings.ToUpper(name), "GIT_CONFIG_") {
+				return nil, fmt.Errorf("%s_not_supported", name)
+			}
+		}
 		// An explicitly empty GIT_EXEC_PATH still changes Git's child-program
 		// lookup semantics on some platforms. Remove it completely and freeze
 		// the resulting environment for both classification probes and execution.
@@ -419,6 +426,9 @@ func classifySegment(ctx context.Context, workspaceRoot, raw string) Action {
 	if action.Eligible {
 		action.Executable = executablePath
 		arguments := append([]string(nil), words[1:]...)
+		if action.Arguments != nil {
+			arguments = append([]string(nil), action.Arguments...)
+		}
 		if executable == "git" && action.Summary == "git fetch" {
 			arguments, err = pinGitFetchNoRecurse(arguments)
 			if err != nil {
@@ -465,6 +475,7 @@ func classifyGit(ctx context.Context, workspaceRoot string, args []string) Actio
 	if err != nil {
 		return ineligible("cannot_resolve_workspace_directory")
 	}
+	prefix := make([]string, 0, 4)
 	for len(args) > 0 {
 		switch args[0] {
 		case "-C":
@@ -475,8 +486,10 @@ func classifyGit(ctx context.Context, workspaceRoot string, args []string) Actio
 			if err != nil {
 				return ineligible("git_-C_path_outside_workspace_or_not_directory")
 			}
+			prefix = append(prefix, args[0], args[1])
 			args = args[2:]
 		case "--no-pager", "--literal-pathspecs":
+			prefix = append(prefix, args[0])
 			args = args[1:]
 		case "-c", "--git-dir", "--work-tree", "--namespace":
 			return ineligible("git_global_override_not_supported")
@@ -494,24 +507,33 @@ parsedGlobals:
 	}
 	subcommand := strings.ToLower(args[0])
 	subargs := args[1:]
+	var action Action
 	switch subcommand {
 	case "status", "diff", "log", "show", "rev-parse":
-		return classifyGitRead(ctx, repo, repoAbs, subcommand, subargs)
+		action = classifyGitRead(ctx, repo, repoAbs, subcommand, subargs)
 	case "branch":
-		return classifyGitBranch(ctx, repo, repoAbs, subargs)
+		action = classifyGitBranch(ctx, repo, repoAbs, subargs)
 	case "fetch":
-		return classifyGitFetch(ctx, workspaceRoot, repo, repoAbs, subargs)
+		action = classifyGitFetch(ctx, workspaceRoot, repo, repoAbs, subargs)
 	case "switch":
-		return classifyGitSwitch(ctx, workspaceRoot, repo, repoAbs, subargs)
+		action = classifyGitSwitch(ctx, workspaceRoot, repo, repoAbs, subargs)
 	case "add":
-		return classifyGitAdd(ctx, workspaceRoot, repo, repoAbs, commandDir, subargs)
+		action = classifyGitAdd(ctx, workspaceRoot, repo, repoAbs, commandDir, subargs)
 	case "commit":
-		return classifyGitCommit(ctx, workspaceRoot, repo, repoAbs, subargs)
+		action = classifyGitCommit(ctx, workspaceRoot, repo, repoAbs, subargs)
 	case "push":
-		return classifyGitPush(ctx, workspaceRoot, repo, repoAbs, subargs)
+		action = classifyGitPush(ctx, workspaceRoot, repo, repoAbs, subargs)
 	default:
 		return ineligible("unsupported_git_subcommand:" + subcommand)
 	}
+	if action.Eligible && action.Arguments != nil {
+		arguments := make([]string, 0, len(prefix)+1+len(action.Arguments))
+		arguments = append(arguments, prefix...)
+		arguments = append(arguments, subcommand)
+		arguments = append(arguments, action.Arguments...)
+		action.Arguments = arguments
+	}
+	return action
 }
 
 func classifyGitRead(ctx context.Context, repo, repoAbs, subcommand string, args []string) Action {
@@ -545,11 +567,11 @@ func classifyGitRead(ctx context.Context, repo, repoAbs, subcommand string, args
 		if usesExternalAttributes {
 			return ineligible("git_status_external_filter_not_supported")
 		}
-		target, err := resolveGitReadTarget(ctx, repoAbs, "")
+		target, _, err := resolveGitReadTarget(ctx, repoAbs, "")
 		if err != nil {
 			return ineligible("cannot_resolve_git_status_target")
 		}
-		return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git status"}
+		return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git status", Arguments: canonicalGitReadArguments(args, -1, "")}
 	default:
 		return ineligible("unsupported_git_read_subcommand:" + subcommand)
 	}
@@ -565,7 +587,8 @@ func classifyGitLogRead(ctx context.Context, repo, repoAbs string, args []string
 	}
 	hasOneline := false
 	revision := ""
-	for _, arg := range args {
+	revisionIndex := -1
+	for index, arg := range args {
 		switch {
 		case arg == "--oneline":
 			if hasOneline {
@@ -579,6 +602,7 @@ func classifyGitLogRead(ctx context.Context, repo, repoAbs string, args []string
 				return ineligible("multiple_git_log_revisions_not_supported")
 			}
 			revision = arg
+			revisionIndex = index
 		default:
 			return ineligible("unsupported_git_log_option_or_path:" + arg)
 		}
@@ -586,16 +610,17 @@ func classifyGitLogRead(ctx context.Context, repo, repoAbs string, args []string
 	if !hasOneline {
 		return ineligible("git_log_requires_explicit_--oneline")
 	}
-	target, err := resolveGitReadTarget(ctx, repoAbs, revision)
+	target, canonicalRevision, err := resolveGitReadTarget(ctx, repoAbs, revision)
 	if err != nil {
 		return ineligible("cannot_resolve_git_log_target")
 	}
-	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git log"}
+	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git log", Arguments: canonicalGitReadArguments(args, revisionIndex, canonicalRevision)}
 }
 
 func classifyGitRevParseRead(ctx context.Context, repo, repoAbs string, args []string) Action {
 	revision := ""
-	for _, arg := range args {
+	revisionIndex := -1
+	for index, arg := range args {
 		switch arg {
 		case "--show-toplevel", "--show-prefix", "--show-cdup", "--show-superproject-working-tree", "--is-inside-work-tree", "--is-bare-repository", "--absolute-git-dir", "--git-dir", "--git-common-dir":
 			continue
@@ -604,13 +629,14 @@ func classifyGitRevParseRead(ctx context.Context, repo, repoAbs string, args []s
 				return ineligible("unsupported_git_rev_parse_argument:" + arg)
 			}
 			revision = arg
+			revisionIndex = index
 		}
 	}
-	target, err := resolveGitReadTarget(ctx, repoAbs, revision)
+	target, canonicalRevision, err := resolveGitReadTarget(ctx, repoAbs, revision)
 	if err != nil {
 		return ineligible("cannot_resolve_git_rev_parse_target")
 	}
-	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git rev-parse"}
+	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git rev-parse", Arguments: canonicalGitReadArguments(args, revisionIndex, canonicalRevision)}
 }
 
 func classifyGitDiffRead(ctx context.Context, repo, repoAbs string, args []string) Action {
@@ -619,8 +645,9 @@ func classifyGitDiffRead(ctx context.Context, repo, repoAbs string, args []strin
 	separator := false
 	pathCount := 0
 	revision := ""
+	revisionIndex := -1
 	seenOptions := map[string]bool{}
-	for _, arg := range args {
+	for index, arg := range args {
 		if separator {
 			if !safeGitReadToken(arg) {
 				return ineligible("unsupported_git_diff_path:" + arg)
@@ -656,6 +683,7 @@ func classifyGitDiffRead(ctx context.Context, repo, repoAbs string, args []strin
 				return ineligible("unsupported_git_diff_revision_or_path:" + arg)
 			}
 			revision = arg
+			revisionIndex = index
 		}
 	}
 	if separator && pathCount == 0 {
@@ -671,19 +699,21 @@ func classifyGitDiffRead(ctx context.Context, repo, repoAbs string, args []strin
 	if usesExternalAttributes {
 		return ineligible("git_diff_external_filter_not_supported")
 	}
-	currentTarget, err := resolveGitReadTarget(ctx, repoAbs, "")
+	currentTarget, _, err := resolveGitReadTarget(ctx, repoAbs, "")
 	if err != nil {
 		return ineligible("cannot_resolve_git_diff_current_target")
 	}
 	targets := []string{currentTarget}
+	canonicalRevision := ""
 	if revision != "" {
-		revisionTarget, targetErr := resolveGitReadTarget(ctx, repoAbs, revision)
+		revisionTarget, canonical, targetErr := resolveGitReadTarget(ctx, repoAbs, revision)
 		if targetErr != nil {
 			return ineligible("cannot_resolve_git_diff_revision_target")
 		}
 		targets = append(targets, revisionTarget)
+		canonicalRevision = canonical
 	}
-	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: sortedUnique(targets), Summary: "git diff"}
+	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: sortedUnique(targets), Summary: "git diff", Arguments: canonicalGitReadArguments(args, revisionIndex, canonicalRevision)}
 }
 
 func classifyGitShowRead(ctx context.Context, repo, repoAbs string, args []string) Action {
@@ -691,8 +721,9 @@ func classifyGitShowRead(ctx context.Context, repo, repoAbs string, args []strin
 	hasNoTextconv := false
 	hasOneline := false
 	object := ""
+	objectIndex := -1
 	seenOptions := map[string]bool{}
-	for _, arg := range args {
+	for index, arg := range args {
 		switch arg {
 		case "--no-ext-diff":
 			if seenOptions[arg] {
@@ -725,6 +756,7 @@ func classifyGitShowRead(ctx context.Context, repo, repoAbs string, args []strin
 				return ineligible("unsupported_git_show_object_or_path:" + arg)
 			}
 			object = arg
+			objectIndex = index
 		}
 	}
 	if !hasNoExternalDiff || !hasNoTextconv {
@@ -736,6 +768,10 @@ func classifyGitShowRead(ctx context.Context, repo, repoAbs string, args []strin
 	if object == "" {
 		return ineligible("git_show_requires_explicit_object")
 	}
+	target, canonicalObject, err := resolveGitReadTarget(ctx, repoAbs, object)
+	if err != nil {
+		return ineligible("cannot_resolve_git_show_target")
+	}
 	showSignatures, err := gitReadSignaturesEnabled(ctx, repoAbs)
 	if err != nil {
 		return ineligible("cannot_resolve_git_show_signature_configuration")
@@ -743,18 +779,14 @@ func classifyGitShowRead(ctx context.Context, repo, repoAbs string, args []strin
 	if showSignatures {
 		return ineligible("git_show_signature_verification_not_supported")
 	}
-	usesExternalAttributes, err := repositoryUsesExternalAttributes(ctx, repoAbs, object)
+	usesExternalAttributes, err := repositoryUsesExternalAttributes(ctx, repoAbs, canonicalObject)
 	if err != nil {
 		return ineligible("cannot_resolve_git_show_attributes")
 	}
 	if usesExternalAttributes {
 		return ineligible("git_show_external_filter_not_supported")
 	}
-	target, err := resolveGitReadTarget(ctx, repoAbs, object)
-	if err != nil {
-		return ineligible("cannot_resolve_git_show_target")
-	}
-	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git show"}
+	return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git show", Arguments: canonicalGitReadArguments(args, objectIndex, canonicalObject)}
 }
 
 func gitReadSignaturesEnabled(ctx context.Context, repoAbs string) (bool, error) {
@@ -783,16 +815,25 @@ func safeGitReadToken(value string) bool {
 	return normalized != ".." && !strings.HasPrefix(normalized, "../") && !strings.Contains(normalized, "/../")
 }
 
+func canonicalGitReadArguments(args []string, revisionIndex int, canonicalRevision string) []string {
+	result := make([]string, len(args))
+	copy(result, args)
+	if revisionIndex >= 0 && canonicalRevision != "" {
+		result[revisionIndex] = canonicalRevision
+	}
+	return result
+}
+
 func classifyGitBranch(ctx context.Context, repo, repoAbs string, args []string) Action {
 	if len(args) == 0 {
 		return ineligible("plain_git_branch_read_not_grant_eligible")
 	}
 	if len(args) == 1 && args[0] == "--show-current" {
-		target, err := resolveGitReadTarget(ctx, repoAbs, "")
+		target, _, err := resolveGitReadTarget(ctx, repoAbs, "")
 		if err != nil {
 			return ineligible("cannot_resolve_git_branch_current_target")
 		}
-		return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git branch --show-current"}
+		return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git branch --show-current", Arguments: canonicalGitReadArguments(args, -1, "")}
 	}
 	deleteMode := false
 	branches := make([]string, 0)
@@ -1507,32 +1548,39 @@ func currentGitBranch(ctx context.Context, repoAbs string) (string, error) {
 	return strings.TrimSpace(output), nil
 }
 
-func resolveGitReadTarget(ctx context.Context, repoAbs, revision string) (string, error) {
+func resolveGitReadTarget(ctx context.Context, repoAbs, revision string) (string, string, error) {
 	revision = strings.TrimSpace(revision)
-	if revision == "" || revision == "HEAD" {
+	if revision == "" {
 		branch, err := currentGitBranch(ctx, repoAbs)
 		if err != nil || branch == "HEAD" || !safeGitName(branch) {
-			return "", errors.New("attached git branch required for grant-eligible read")
+			return "", "", errors.New("attached git branch required for grant-eligible read")
 		}
-		return "branch:" + branch, nil
+		return "branch:" + branch, "", nil
 	}
 
-	branch := strings.TrimPrefix(revision, "refs/heads/")
-	if safeGitName(branch) && localGitBranchExists(ctx, repoAbs, branch) {
-		return "branch:" + branch, nil
+	if isFullGitObjectID(revision) {
+		canonical := strings.ToLower(revision)
+		resolved, err := boundedGit(ctx, repoAbs, "rev-parse", "--verify", "--quiet", canonical+"^{object}")
+		if err != nil {
+			return "", "", err
+		}
+		resolved = strings.ToLower(strings.TrimSpace(resolved))
+		if !isFullGitObjectID(resolved) || resolved != canonical {
+			return "", "", errors.New("full object ID did not resolve to itself")
+		}
+		return "object:" + canonical, canonical, nil
 	}
-	if !isFullGitObjectID(revision) {
-		return "", errors.New("grant-eligible git read target must be a local branch, HEAD, or full object ID")
+
+	const branchPrefix = "refs/heads/"
+	if !strings.HasPrefix(revision, branchPrefix) {
+		return "", "", errors.New("grant-eligible git read target must use default HEAD, explicit refs/heads/<name>, or a full object ID")
 	}
-	resolved, err := boundedGit(ctx, repoAbs, "rev-parse", "--verify", "--quiet", revision+"^{object}")
-	if err != nil {
-		return "", err
+	branch := strings.TrimPrefix(revision, branchPrefix)
+	if !safeGitName(branch) || !localGitBranchExists(ctx, repoAbs, branch) {
+		return "", "", errors.New("explicit git branch target does not exist or is unsafe")
 	}
-	resolved = strings.TrimSpace(resolved)
-	if !isFullGitObjectID(resolved) {
-		return "", errors.New("git read object did not resolve to a full object ID")
-	}
-	return "object:" + strings.ToLower(resolved), nil
+	canonical := branchPrefix + branch
+	return "branch:" + branch, canonical, nil
 }
 
 func isFullGitObjectID(value string) bool {
@@ -1616,6 +1664,14 @@ func resolveGitRemote(ctx context.Context, workspaceRoot, repoAbs, remote string
 }
 
 func networkCredentialHelperGrantSafety(ctx context.Context, repoAbs string) error {
+	urlScoped, err := boundedGitOptional(ctx, repoAbs, "config", "--get-regexp", `^credential\..+\.helper$`)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(urlScoped) != "" {
+		return errors.New("URL-scoped credential helper configuration is not grant eligible")
+	}
+
 	configured, err := boundedGitOptional(ctx, repoAbs, "config", "--show-origin", "--get-all", "credential.helper")
 	if err != nil {
 		return err
@@ -1664,10 +1720,6 @@ func canonicalRemoteRepository(workspaceRoot, repoAbs, remote string) (string, e
 	if strings.Contains(remote, "::") {
 		return "", errors.New("git remote-helper transport syntax is not grant eligible")
 	}
-	lower := strings.ToLower(remote)
-	if strings.HasPrefix(lower, "git@github.com:") {
-		return NormalizeRepository("github:" + remote[len("git@github.com:"):])
-	}
 	if !strings.Contains(remote, "://") && hasAmbiguousGitScpSyntax(remote) {
 		return "", errors.New("ambiguous scp-like git remote is not grant eligible")
 	}
@@ -1684,16 +1736,7 @@ func canonicalRemoteRepository(workspaceRoot, repoAbs, remote string) (string, e
 			}
 			return NormalizeRepository("github:" + strings.TrimPrefix(parsed.Path, "/"))
 		case "ssh":
-			password := false
-			username := ""
-			if parsed.User != nil {
-				username = parsed.User.Username()
-				_, password = parsed.User.Password()
-			}
-			if !strings.EqualFold(parsed.Hostname(), "github.com") || parsed.Port() != "" || username != "git" || password || parsed.RawQuery != "" || parsed.Fragment != "" {
-				return "", errors.New("grant-eligible SSH remotes must use git@github.com without overrides")
-			}
-			return NormalizeRepository("github:" + strings.TrimPrefix(parsed.Path, "/"))
+			return "", errors.New("SSH git remotes are not grant eligible in Stage V1")
 		case "file":
 			if parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 				return "", errors.New("grant-eligible file remotes must be local paths without host, query, or fragment")
@@ -1741,7 +1784,7 @@ func hasAmbiguousGitScpSyntax(remote string) bool {
 }
 
 func isWindowsAbsoluteDrivePath(value string) bool {
-	if len(value) < 3 || value[1] != ':' || value[2] != '/' && value[2] != '\\' {
+	if runtime.GOOS != "windows" || len(value) < 3 || value[1] != ':' || value[2] != '/' && value[2] != '\\' {
 		return false
 	}
 	letter := value[0]
