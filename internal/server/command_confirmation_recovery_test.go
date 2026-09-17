@@ -102,12 +102,24 @@ func TestCommandConfirmationRecoveryThroughPublicSchema(t *testing.T) {
 			if !statusOK(first) || first["data"].(map[string]any)["exit_code"] != float64(0) {
 				t.Fatalf("确认恢复失败: %+v", first)
 			}
-			taskID := first["data"].(map[string]any)["execution_task_id"]
+			// 短命令响应不包含 Task ID，直接核对持久化任务，避免两个 nil 比较。
+			tasks, err := rt.tasks.List(s.ID, 10)
+			if err != nil || len(tasks) != 1 {
+				t.Fatalf("首次执行的持久化任务不唯一: %+v, %v", tasks, err)
+			}
+			taskID, _ := tasks[0]["execution_task_id"].(string)
+			if taskID == "" {
+				t.Fatal("缺少持久化 Task 身份")
+			}
 			// 成功后分别重放返回模板与调用方保存的原请求。
 			for _, replayArgs := range []map[string]any{retry, want} {
 				replay := call(replayArgs)
-				if !statusOK(replay) || replay["data"].(map[string]any)["idempotent_replay"] != true || replay["data"].(map[string]any)["execution_task_id"] != taskID {
+				if !statusOK(replay) || replay["data"].(map[string]any)["idempotent_replay"] != true {
 					t.Fatalf("未回读同一执行结果: %+v", replay)
+				}
+				tasks, err = rt.tasks.List(s.ID, 10)
+				if err != nil || len(tasks) != 1 || tasks[0]["execution_task_id"] != taskID {
+					t.Fatalf("重试创建了不同或额外任务: %+v, %v", tasks, err)
 				}
 			}
 			content, err := os.ReadFile(output)
