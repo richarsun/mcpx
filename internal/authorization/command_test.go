@@ -884,6 +884,47 @@ func TestClassifierRejectsUntrustedCredentialHelperAcrossConfigScopes(t *testing
 	})
 }
 
+func TestClassifierAllowsTrustedWindowsSystemCredentialManager(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("trusted Git for Windows credential manager positive path is Windows-only")
+	}
+	workspace, repo := newGitFixture(t)
+	ctx := withGrantTestExecutables(t, context.Background())
+	runGit(t, repo, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
+
+	gitExecutable, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitExecutable, err = filepath.Abs(gitExecutable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := trustedGitInstallationRoot(gitExecutable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configOutput := gitOutput(t, repo, "config", "--system", "--show-origin", "--get-all", "credential.helper")
+	expectedOrigin := "file:" + filepath.ToSlash(filepath.Join(root, "etc", "gitconfig")) + "\tmanager"
+	if !strings.EqualFold(strings.TrimSpace(configOutput), expectedOrigin) {
+		t.Skipf("trusted system manager fixture unavailable: got %q want %q", configOutput, expectedOrigin)
+	}
+
+	action := ClassifyCommand(ctx, workspace, []string{"git -C repo fetch --no-tags --refmap= origin main"})
+	if !action.Eligible {
+		t.Fatalf("trusted Windows system credential manager should remain grant eligible: %+v", action)
+	}
+	assertContains(t, action.Repositories, "github:owner/repo")
+
+	runGit(t, repo, "config", "--add", "credential.https://github.com.helper", "")
+	runGit(t, repo, "config", "--add", "credential.https://github.com.helper", "!malicious-helper")
+	overridden := ClassifyCommand(ctx, workspace, []string{"git -C repo fetch --no-tags --refmap= origin main"})
+	if overridden.Eligible {
+		t.Fatalf("system manager plus URL reset/override became grant eligible: %+v", overridden)
+	}
+	assertContains(t, overridden.Reasons, "segment_1:unresolved_git_remote:origin")
+}
+
 func TestClassifierRejectsAllSSHRemotesBeforeSSHConfigExecution(t *testing.T) {
 	for _, remoteURL := range []string{"git@github.com:owner/repo.git", "ssh://git@github.com/owner/repo.git"} {
 		t.Run(remoteURL, func(t *testing.T) {
