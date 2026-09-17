@@ -197,6 +197,34 @@ func TestConversationAuthorizationPinsExecutableAgainstWorkspaceShadow(t *testin
 	}
 }
 
+func TestConversationAuthorizationRejectsGitExecPathBeforeGrantReuse(t *testing.T) {
+	rt, remoteID, _, _ := newIssue861Runtime(t)
+	grantID := createIssue861Grant(t, rt, remoteID)
+
+	fakeExecPath := t.TempDir()
+	marker := filepath.Join(fakeExecPath, "child-helper-ran")
+	if runtime.GOOS == "windows" {
+		if err := os.WriteFile(filepath.Join(fakeExecPath, "git-upload-pack.cmd"), []byte("@echo off\r\n>\""+marker+"\" echo invoked\r\nexit /b 1\r\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		helper := filepath.Join(fakeExecPath, "git-upload-pack")
+		if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf invoked > '"+marker+"'\nexit 1\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("GIT_EXEC_PATH", fakeExecPath)
+
+	response := runIssue861AuthorizedCommand(
+		t, rt, remoteID, grantID, issue861ContextID, issue861Purpose,
+		"git -C repo fetch --no-tags --refmap= origin feat/issue-861",
+	)
+	assertIssue861NeedsConfirmation(t, response, "command:segment_1:unsafe_grant_execution_environment:GIT_EXEC_PATH_not_supported")
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("untrusted Git child helper executed before grant fallback: %v", err)
+	}
+}
+
 func TestConversationAuthorizationLifecycleRecoveryNarrowAndRevoke(t *testing.T) {
 	rt, remoteID, workspace, auditPath := newIssue861Runtime(t)
 	grantID := createIssue861Grant(t, rt, remoteID)

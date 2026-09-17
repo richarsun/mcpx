@@ -106,6 +106,7 @@ type Action struct {
 	Reasons      []string `json:"reasons,omitempty"`
 	Executable   string   `json:"-"`
 	Arguments    []string `json:"-"`
+	Environment  []string `json:"-"`
 }
 
 // MatchResult explains exactly why an action did or did not fit a grant.

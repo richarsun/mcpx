@@ -34,6 +34,7 @@ const (
 type ProcessSpec struct {
 	Executable   string
 	Args         []string
+	Env          []string
 	Stdin        string
 	WallLimit    time.Duration
 	CPUTimeLimit time.Duration
@@ -204,6 +205,9 @@ func (m *TaskManager) StartRemoteProcessWithObservationContext(requestID, callID
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, spec.Executable, spec.Args...)
 	cmd.Dir = workDir
+	if spec.Env != nil {
+		cmd.Env = append([]string(nil), spec.Env...)
+	}
 	configureProcess(cmd)
 	return m.startPrepared(requestID, callID, tool, remoteSessionID, workspaceName, workDir, displayCommand, cmd, cancel, false, spec.Stdin, spec.WallLimit, spec.CPUTimeLimit)
 }

@@ -61,6 +61,13 @@ func TestClassifyBoundedGitWorkPackage(t *testing.T) {
 			repository: "workspace:repo",
 		},
 		{
+			name:       "read current branch",
+			command:    "git -C repo branch --show-current",
+			class:      "git_read",
+			repository: "workspace:repo",
+			target:     "branch:feat/issue-861",
+		},
+		{
 			name:       "remote fetch",
 			command:    "git -C repo fetch --no-tags --refmap= origin main",
 			class:      "git_remote_read",
@@ -150,6 +157,15 @@ func TestClassifyBoundedGitWorkPackage(t *testing.T) {
 			}
 			if !filepath.IsAbs(action.Executable) || len(action.Arguments) == 0 {
 				t.Fatalf("eligible action did not pin an executable and argv: %+v", action)
+			}
+			if action.Environment == nil {
+				t.Fatalf("eligible action did not freeze its execution environment: %+v", action)
+			}
+			if len(action.Repositories) == 0 {
+				t.Fatalf("eligible action escaped repository scoping: %+v", action)
+			}
+			if test.class == "git_read" && len(action.Targets) == 0 {
+				t.Fatalf("grant-eligible git_read escaped target scoping: %+v", action)
 			}
 			assertContains(t, action.Classes, test.class)
 			assertContains(t, action.Repositories, test.repository)
@@ -605,6 +621,134 @@ func TestClassifierRejectsRemoteHelperProtocolAndVCSOverride(t *testing.T) {
 	})
 }
 
+func TestClassifierRejectsAmbiguousGitRemoteTransportForms(t *testing.T) {
+	for _, remoteURL := range []string{
+		"reviewprobe::github.com/owner/repo",
+		"example.com:path",
+		"user@example.com:path",
+	} {
+		t.Run(remoteURL, func(t *testing.T) {
+			workspace, repo := newGitFixture(t)
+			ctx := withGrantTestExecutables(t, context.Background())
+			runGit(t, repo, "remote", "set-url", "origin", remoteURL)
+
+			marker := ""
+			if strings.Contains(remoteURL, "::") {
+				helperDir := t.TempDir()
+				marker = filepath.Join(helperDir, "remote-helper-ran")
+				if runtime.GOOS == "windows" {
+					writeFile(t, filepath.Join(helperDir, "git-remote-reviewprobe.cmd"), "@echo off\r\n>\""+marker+"\" echo invoked\r\nexit /b 1\r\n")
+				} else {
+					helper := filepath.Join(helperDir, "git-remote-reviewprobe")
+					writeFile(t, helper, "#!/bin/sh\nprintf invoked > '"+marker+"'\nexit 1\n")
+					if err := os.Chmod(helper, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
+				t.Setenv("PATH", helperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+				if runtime.GOOS != "windows" {
+					// Reproduce the exact ambiguity from the review: a lookalike local
+					// repository exists, while Git itself would still parse the same
+					// string as a remote-helper transport.
+					lookalike := filepath.Join(repo, filepath.FromSlash(remoteURL))
+					if err := os.MkdirAll(filepath.Dir(lookalike), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					command := exec.Command("git", "init", "--bare", lookalike)
+					if output, err := command.CombinedOutput(); err != nil {
+						t.Fatalf("create remote-helper lookalike repository: %v\n%s", err, output)
+					}
+				}
+			}
+
+			for _, command := range []string{
+				"git -C repo fetch --no-tags --refmap= origin main",
+				"git -C repo push origin feat/issue-861",
+			} {
+				action := ClassifyCommand(ctx, workspace, []string{command})
+				if action.Eligible {
+					t.Fatalf("ambiguous Git remote transport became grant eligible: %s => %+v", remoteURL, action)
+				}
+				assertContains(t, action.Reasons, "segment_1:unresolved_git_remote:origin")
+			}
+			if marker != "" {
+				if _, err := os.Stat(marker); !os.IsNotExist(err) {
+					t.Fatalf("remote helper executed before ambiguous transport was rejected: %v", err)
+				}
+			}
+		})
+	}
+
+	for _, path := range []string{`C:\repo`, "C:/repo"} {
+		if hasAmbiguousGitScpSyntax(path) {
+			t.Fatalf("Windows absolute drive path was misclassified as scp syntax: %q", path)
+		}
+	}
+	if !hasAmbiguousGitScpSyntax("C:repo") {
+		t.Fatal("Windows drive-relative path must remain fail-closed as ambiguous")
+	}
+}
+
+func TestClassifierSanitizesGitChildPATH(t *testing.T) {
+	workspace, _ := newGitFixture(t)
+	ctx := withGrantTestExecutables(t, context.Background())
+	hostile := t.TempDir()
+	t.Setenv("PATH", hostile+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	action := ClassifyCommand(ctx, workspace, []string{"git -C repo status --short"})
+	if !action.Eligible {
+		t.Fatalf("ordinary status became ineligible while sanitizing child PATH: %+v", action)
+	}
+	pathValue, present := environmentValue(action.Environment, "PATH")
+	if !present || strings.TrimSpace(pathValue) == "" {
+		t.Fatalf("grant environment did not pin PATH: %+v", action.Environment)
+	}
+	for _, entry := range filepath.SplitList(pathValue) {
+		if strings.EqualFold(filepath.Clean(entry), filepath.Clean(hostile)) {
+			t.Fatalf("hostile PATH entry survived grant environment freezing: %q", pathValue)
+		}
+	}
+}
+
+func TestClassifierRejectsGitExecPathBeforeGitProbe(t *testing.T) {
+	workspace, _ := newGitFixture(t)
+	ctx := withGrantTestExecutables(t, context.Background())
+	fakeExecPath := t.TempDir()
+	marker := filepath.Join(fakeExecPath, "child-helper-ran")
+	if runtime.GOOS == "windows" {
+		writeFile(t, filepath.Join(fakeExecPath, "git-upload-pack.cmd"), "@echo off\r\n>\""+marker+"\" echo invoked\r\nexit /b 1\r\n")
+	} else {
+		helper := filepath.Join(fakeExecPath, "git-upload-pack")
+		writeFile(t, helper, "#!/bin/sh\nprintf invoked > '"+marker+"'\nexit 1\n")
+		if err := os.Chmod(helper, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("GIT_EXEC_PATH", fakeExecPath)
+
+	action := ClassifyCommand(ctx, workspace, []string{"git -C repo fetch --no-tags --refmap= origin main"})
+	if action.Eligible {
+		t.Fatalf("non-empty GIT_EXEC_PATH became grant eligible: %+v", action)
+	}
+	assertContains(t, action.Reasons, "segment_1:unsafe_grant_execution_environment:GIT_EXEC_PATH_not_supported")
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("Git child helper executed before grant classification failed closed: %v", err)
+	}
+}
+
+func TestClassifierRejectsUntrustedCredentialHelperAcrossConfigScopes(t *testing.T) {
+	workspace, repo := newGitFixture(t)
+	ctx := withGrantTestExecutables(t, context.Background())
+	runGit(t, repo, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
+	runGit(t, repo, "config", "credential.helper", "!external-helper")
+
+	action := ClassifyCommand(ctx, workspace, []string{"git -C repo fetch --no-tags --refmap= origin main"})
+	if action.Eligible {
+		t.Fatalf("untrusted credential helper became grant eligible: %+v", action)
+	}
+	assertContains(t, action.Reasons, "segment_1:unresolved_git_remote:origin")
+}
+
 func TestClassifierRejectsNetworkGitCommandOverrides(t *testing.T) {
 	workspace, repo := newGitFixture(t)
 	ctx := context.Background()
@@ -844,7 +988,7 @@ func TestResolveGrantExecutableRejectsWorkspaceExternalPATHShadowBeforeProbe(t *
 }
 
 func TestGitReadTargetsRespectGrantAndNarrowing(t *testing.T) {
-	workspace, _ := newGitFixture(t)
+	workspace, repo := newGitFixture(t)
 	ctx := withGrantTestExecutables(t, context.Background())
 	commands := []string{
 		"git -C repo log --oneline main",
@@ -858,6 +1002,18 @@ func TestGitReadTargetsRespectGrantAndNarrowing(t *testing.T) {
 		}
 		assertContains(t, action.Targets, "branch:main")
 	}
+
+	runGit(t, repo, "switch", "main")
+	currentBranchRead := ClassifyCommand(ctx, workspace, []string{"git -C repo branch --show-current"})
+	if !currentBranchRead.Eligible {
+		t.Fatalf("current branch read was not classifiable: %+v", currentBranchRead)
+	}
+	assertContains(t, currentBranchRead.Targets, "branch:main")
+	plainBranchRead := ClassifyCommand(ctx, workspace, []string{"git -C repo branch"})
+	if plainBranchRead.Eligible {
+		t.Fatalf("plain git branch enumerates multiple refs and must not reuse a target-scoped grant: %+v", plainBranchRead)
+	}
+	assertContains(t, plainBranchRead.Reasons, "segment_1:plain_git_branch_read_not_grant_eligible")
 
 	now := time.Date(2026, 9, 15, 8, 0, 0, 0, time.UTC)
 	wideScope, err := NormalizeScope(Scope{
@@ -892,6 +1048,22 @@ func TestGitReadTargetsRespectGrantAndNarrowing(t *testing.T) {
 		t.Fatalf("read of removed branch target matched after narrowing: %+v", match)
 	}
 	assertContains(t, match.Reasons, "target_out_of_scope:branch:main")
+	if match := Match(Grant{Status: StatusActive, Scope: wideScope, ExpiresAt: now.Add(time.Hour)}, "issue 861 implementation", currentBranchRead, now); !match.Matched {
+		t.Fatalf("current main branch read should match before narrowing: %+v", match)
+	}
+	branchMatch := Match(Grant{Status: StatusActive, Scope: narrowScope, ExpiresAt: now.Add(time.Hour)}, "issue 861 implementation", currentBranchRead, now)
+	if branchMatch.Matched {
+		t.Fatalf("current main branch read matched after narrowing: %+v", branchMatch)
+	}
+	assertContains(t, branchMatch.Reasons, "target_out_of_scope:branch:main")
+
+	head := gitOutput(t, repo, "rev-parse", "HEAD")
+	runGit(t, repo, "checkout", "--detach", head)
+	detached := ClassifyCommand(ctx, workspace, []string{"git -C repo branch --show-current"})
+	if detached.Eligible {
+		t.Fatalf("detached HEAD branch read became grant eligible: %+v", detached)
+	}
+	assertContains(t, detached.Reasons, "segment_1:cannot_resolve_git_branch_current_target")
 }
 
 func TestUnsafePathTextRejectsControlCharacters(t *testing.T) {

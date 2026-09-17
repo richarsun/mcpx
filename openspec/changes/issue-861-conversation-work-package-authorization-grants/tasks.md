@@ -26,8 +26,12 @@
 
 - [x] 授权模型、持久化、分类器正反测试。
 - [x] Runtime Git 工作包、边界、deny、lifecycle、recovery、audit、move_out 隔离聚焦 E2E。
-- [x] 首个冻结候选 `e37eec9` 经独立 Reviewer 返回 NEEDS_FIX 后，已针对 5 个 P1 增加负向回归并完成修复；重新运行完整 gofmt、diff-check、普通 build、CGO=0 build、go vet、整仓 `go test ./... -count=1` 与 affected race，全部门禁通过，OpenSpec CURRENT/change 全量 strict validation 为 2/2 PASS。历史 full-repo race 的唯一 OAuth 间歇失败已在 exact base `3f81d08` 复现，#861 未修改 OAuth。
-- [ ] 冻结 Reviewer 修复后的完整 diff、new exact commit 和 tree，并完成作者自检。
-- [ ] 由同一独立只读 Reviewer 复核 `e37eec9..new-head` 修复 delta 及新冻结候选；未取得 PASS 前保持 review-required。
-- [ ] 正常 push 新修复 commit 到既有 feature branch / Draft PR `richarsun/mcpx#3`，并向 #861 回写新 commit/tree、五项修复、验证和剩余风险。
+- [x] 首个冻结候选 `e37eec9` 经独立 Reviewer 返回 NEEDS_FIX 后，已针对 5 个 P1 增加负向回归并完成第一轮修复；候选推进为 `42e952e` / tree `6597b90c...`，并重新通过当轮门禁。
+- [x] 同一独立 Reviewer 对 `42e952e` 第二轮复审仍返回 NEEDS_FIX：`transport::address` / scp-like remote 可造成 repository 解释漂移；`GIT_EXEC_PATH` 可让可信顶层 Git 启动未受控 child program；`git branch` read 仍可产生空 `Action.Targets`。Reviewer 已确认第一轮 commit filter、隐藏 submodule 以及顶层 PATH wrapper 等修复本身闭合。
+- [x] 按本 change 的四条安全不变量完成 Git grant surface audit：remote identity、execution surface/environment、target completeness、classification/execution equivalence；逐项核对全部 grant-eligible Git action 的 repository/target/write-domain/top-level executable/argv/environment/child-helper 执行面。
+- [x] 结构性修复第二轮 3 个 P1：在本地路径归一化前拒绝 helper/scp 歧义 remote；分类探测与 grant-backed 实际进程共享冻结 environment，在任何 Git 探测前拒绝非空 `GIT_EXEC_PATH`；`git branch --show-current` 绑定当前 branch，plain `git branch` grant-ineligible。另将 grant-backed Git PATH 收敛到受信任 Git/系统目录，并只允许可绑定到同一受信任 Git for Windows 安装的 system `credential.helper=manager`。
+- [x] 增加 fetch/push remote-helper side-effect marker、Runtime `GIT_EXEC_PATH` child marker、hostile PATH 清洗、非受信 credential helper、branch narrow/detached/plain-read 以及 Git action repository/target/environment invariant 回归。
+- [x] 重新运行定向/包级/Runtime/整仓与静态门禁：Windows `internal/authorization` PASS 102.864s；Windows `TestConversationAuthorization*` PASS 66.211s；Linux authorization PASS 4.983s；Linux `go test ./... -count=1` PASS（authorization 18.578s、server 172.194s）；affected race PASS（authorization 6.732s、server 267.279s）；gofmt、diff-check、普通 build、vet、CGO=0 build 均 exit 0；OpenSpec strict 2 passed / 0 failed。历史 unrelated full-repo race 问题未声明为 PASS。
+- [ ] 以 `42e952e` 为唯一 parent 创建普通 follow-up commit，冻结 new exact commit/tree，正常 fast-forward push 原 branch；保持 Draft PR `richarsun/mcpx#3` 与 #861 open，不 amend/force-push/merge/release/deploy/tag。
+- [ ] 由同一独立只读 Reviewer 仅复核 `42e952e..new-head` 收敛 delta、四条安全不变量和新冻结候选；未取得 PASS 前保持 review-required。
 - [x] 不部署、不发布；只有后续新的明确授权才进入发行阶段。

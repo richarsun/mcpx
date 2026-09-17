@@ -54,6 +54,43 @@ Runtime SHALL 在每次动作重新运行现有策略和 scope 匹配。只有�
 - **THEN** 首版分类器 SHALL 不允许普通 grant 自动复用
 - **AND** 现有逐命令安全策略 SHALL 继续生效
 
+### Requirement: Grant reuse 必须绑定唯一且等价的 Git 执行面
+
+Runtime SHALL 只对能够证明分类语义与实际执行语义一致的 Git 动作复用 grant。分类器 SHALL 将 repository/target、顶层 executable、argv 以及会改变 Git child program/transport 解析的关键环境共同视为授权执行边界；任何歧义、未知或漂移 SHALL fail-closed。
+
+#### Scenario: Remote 字符串不得有第二种 Git transport 解释
+
+- **WHEN** remote URL 使用 `<transport>::<address>`、非明确允许的 scp-like `host:path` / `user@host:path`，或其他会被 Git 解释为 helper/SSH transport 而分类器可能当成本地路径的形式
+- **THEN** 分类器 SHALL 在 Workspace 本地路径归一化之前将该动作标为 grant-ineligible
+- **AND** fetch/push SHALL NOT 在任何 remote helper 启动后才以非零退出码作为安全回退
+- **AND** 合法 Windows 绝对盘符路径 SHALL 与 scp-like 语法明确区分
+
+#### Scenario: Git child program 环境不得绕过可信顶层 executable
+
+- **WHEN** 当前进程环境设置了能够替换 Git child program 的 `GIT_EXEC_PATH`
+- **THEN** grant 分类 SHALL 在任何 Git 探测或 child program 副作用之前 fail-closed，或使用经验证且冻结的安全替代值
+- **AND** grant-backed 实际执行 SHALL 使用与分类探测相同的受控环境语义，而不是重新继承不同的进程环境
+- **AND** grant-backed Git 的 PATH SHALL 由已验证 Git 安装与必要系统目录派生，不得保留任意宿主 PATH shadow
+
+#### Scenario: HTTPS credential helper 必须绑定受信任 Git 安装
+
+- **WHEN** grant-eligible GitHub HTTPS remote 的有效 Git 配置启用了 credential helper
+- **THEN** Runtime SHALL 只在 helper 配置来源与 helper binary 都能绑定到已验证的同一 Git 安装时允许 grant reuse
+- **AND** repository/global/system 中出现的未知、shell、多个或来源不可证明的 helper SHALL fail-closed
+
+#### Scenario: 所有 grant-eligible git_read 都必须有规范 target
+
+- **WHEN** Git read 动作进入 grant allowlist
+- **THEN** `Action.Targets` SHALL 包含至少一个可规范化 branch/object target
+- **AND** `git branch --show-current` SHALL 绑定当前 attached branch
+- **AND** detached/未知 target 或 plain `git branch` SHALL grant-ineligible，而不是以空 target 跳过 matcher 检查
+
+#### Scenario: 分类与执行不得漂移
+
+- **WHEN** Runtime 已用 grant 批准一个 Git 动作
+- **THEN** 实际执行 SHALL 使用分类时冻结的可信 executable、argv 和受控 environment
+- **AND** repository/target/remote/helper 的实际解释 SHALL 不得比分类得到的执行面更宽
+
 ### Requirement: 边界实质变化必须重新受限
 
 Grant SHALL 只在当前 principal、authorization context、Remote Session、Workspace、work package、purpose、repository、target、write path 和风险均在 scope 内时匹配。任一实质变化 SHALL 导致不匹配。

@@ -54,6 +54,17 @@ Repository identity 逐项精确匹配；purpose/target 使用受限 glob；writ
 
 以下情况 grant-ineligible 并回到现有策略：未知/compound command、external diff/textconv、外部输出、hooks/submodule/filter 执行面、force/delete/reset/clean、credential/secret/auth、production/payment/system-network/service、永久删除，以及 `go test/vet/build` 等可能执行仓库代码的验证命令。
 
+### 4.1 Grant reuse 安全不变量
+
+第二轮独立 Review 证明，仅对已知 argv 形态逐点封堵不足以证明授权复用安全。首版 Git grant reuse 必须同时满足以下四条不变量；任一条无法证明时动作必须 grant-ineligible，并回到原逐命令策略：
+
+1. **Remote identity invariant**：分类器规范化出的 repository identity 必须与 Git 实际执行时对 remote 字符串的 transport 解释唯一且一致。`<transport>::<address>`、除明确允许的 canonical `git@github.com:owner/repo` 外的 scp-like `host:path` / `user@host:path` 等歧义连接形式不得先按 Workspace 本地路径归一化；合法 Windows 绝对盘符路径单独识别。
+2. **Execution-surface invariant**：grant 绑定的不只是顶层 executable 与 argv，还包括会改变 Git 子程序解析的关键执行环境。非空 `GIT_EXEC_PATH` 等可替换 Git child program 的环境不得参与 grant reuse；分类探测与真正 grant-backed 执行必须使用同一冻结环境语义。Grant-backed Git 的 PATH 必须由已验证 Git 安装派生，不继承任意宿主 PATH shadow；HTTPS credential helper 只能在来源与 helper binary 都能绑定到同一受信任 Git 安装时进入 grant reuse，否则 fail-closed。
+3. **Target-completeness invariant**：所有 grant-eligible `git_read` 必须具有非空、规范化且可匹配的 `Action.Targets`。无法确定 branch/object target 时必须 fail-closed；`git branch --show-current` 绑定当前 attached branch，plain `git branch` 首版不进入 grant allowlist。
+4. **Classification/execution equivalence**：分类阶段批准的 executable、argv、repository/target 解释和受控环境必须原样约束实际进程；不得出现分类器看到本地 repository 或可信 Git，而执行阶段因 transport/helper/environment 漂移到另一执行面。
+
+实现与测试必须对全部 grant-eligible Git action 做 surface audit：需要 repository scope 的动作不得产生空 repository；需要 target scope 的 `git_read` 不得产生空 target；remote/helper 与 child-program 语义不得依赖分类阶段未冻结的环境。
+
 ## 5. Lifecycle
 
 - `authorization_list`：按当前 identity/context 列出 active 或包含 inactive 历史。

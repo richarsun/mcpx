@@ -204,6 +204,7 @@ func (r *Runtime) executeCommandTask(ctx context.Context, envReq envelope.Reques
 			terminal.ProcessSpec{
 				Executable: authorizationState.Action.Executable,
 				Args:       append([]string(nil), authorizationState.Action.Arguments...),
+				Env:        append([]string(nil), authorizationState.Action.Environment...),
 			},
 		)
 	} else {

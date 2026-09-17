@@ -26,6 +26,7 @@ type pullRequestMetadataResolverContextKey struct{}
 type grantExecutableResolver func(string) (string, error)
 type grantExecutableResolverContextKey struct{}
 type grantExecutablePathsContextKey struct{}
+type grantExecutionEnvironmentContextKey struct{}
 
 func withPullRequestMetadataResolver(ctx context.Context, resolver pullRequestMetadataResolver) context.Context {
 	return context.WithValue(ctx, pullRequestMetadataResolverContextKey{}, resolver)
@@ -53,6 +54,138 @@ func grantExecutablePath(ctx context.Context, name string) string {
 		}
 	}
 	return name
+}
+
+func withGrantExecutionEnvironment(ctx context.Context, environment []string) context.Context {
+	return context.WithValue(ctx, grantExecutionEnvironmentContextKey{}, append([]string(nil), environment...))
+}
+
+func grantExecutionEnvironment(ctx context.Context) []string {
+	if environment, ok := ctx.Value(grantExecutionEnvironmentContextKey{}).([]string); ok {
+		return append([]string(nil), environment...)
+	}
+	return append([]string(nil), os.Environ()...)
+}
+
+func frozenGrantExecutionEnvironment(executable, executablePath string) ([]string, error) {
+	environment := append([]string(nil), os.Environ()...)
+	if executable == "git" {
+		if value, present := environmentValue(environment, "GIT_EXEC_PATH"); present && strings.TrimSpace(value) != "" {
+			return nil, errors.New("GIT_EXEC_PATH_not_supported")
+		}
+		// An explicitly empty GIT_EXEC_PATH still changes Git's child-program
+		// lookup semantics on some platforms. Remove it completely and freeze
+		// the resulting environment for both classification probes and execution.
+		environment = environmentWithoutKeys(environment, "GIT_EXEC_PATH")
+		childPath, err := trustedGitChildPath(executablePath)
+		if err != nil {
+			return nil, err
+		}
+		environment = setEnvironmentValue(environment, "PATH", childPath)
+		environment = setEnvironmentValue(environment, "GIT_TERMINAL_PROMPT", "0")
+		environment = setEnvironmentValue(environment, "GIT_PAGER", "")
+	}
+	if executable == "gh" {
+		environment = setEnvironmentValue(environment, "GH_PROMPT_DISABLED", "1")
+		environment = setEnvironmentValue(environment, "GH_PAGER", "")
+	}
+	return environment, nil
+}
+
+func trustedGitChildPath(executablePath string) (string, error) {
+	if runtime.GOOS != "windows" {
+		return strings.Join([]string{"/usr/bin", "/bin"}, string(os.PathListSeparator)), nil
+	}
+	root, err := trustedGitInstallationRoot(executablePath)
+	if err != nil {
+		return "", err
+	}
+	paths := []string{
+		filepath.Join(root, "cmd"),
+		filepath.Join(root, "mingw64", "bin"),
+		filepath.Join(root, "usr", "bin"),
+		filepath.Join(root, "mingw64", "libexec", "git-core"),
+	}
+	if systemRoot := strings.TrimSpace(os.Getenv("SystemRoot")); systemRoot != "" {
+		paths = append(paths, filepath.Join(systemRoot, "System32"), systemRoot)
+	}
+	return strings.Join(paths, string(os.PathListSeparator)), nil
+}
+
+func trustedGitInstallationRoot(executablePath string) (string, error) {
+	if runtime.GOOS != "windows" {
+		clean := filepath.Clean(executablePath)
+		if filepath.Dir(clean) != "/usr/bin" && filepath.Dir(clean) != "/bin" {
+			return "", errors.New("trusted Git executable has no supported installation root")
+		}
+		return filepath.Dir(clean), nil
+	}
+	clean := filepath.Clean(executablePath)
+	for _, environmentName := range []string{"ProgramFiles", "ProgramFiles(x86)"} {
+		programFiles := strings.TrimSpace(os.Getenv(environmentName))
+		if programFiles == "" {
+			continue
+		}
+		root := filepath.Join(programFiles, "Git")
+		for _, expected := range []string{
+			filepath.Join(root, "cmd", "git.exe"),
+			filepath.Join(root, "bin", "git.exe"),
+			filepath.Join(root, "mingw64", "bin", "git.exe"),
+		} {
+			if strings.EqualFold(clean, filepath.Clean(expected)) {
+				return root, nil
+			}
+		}
+	}
+	return "", errors.New("trusted Git executable has no supported installation root")
+}
+
+func environmentValue(environment []string, name string) (string, bool) {
+	for _, entry := range environment {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func environmentWithoutKeys(environment []string, names ...string) []string {
+	result := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		key, _, ok := strings.Cut(entry, "=")
+		remove := false
+		if ok {
+			for _, name := range names {
+				if strings.EqualFold(key, name) {
+					remove = true
+					break
+				}
+			}
+		}
+		if !remove {
+			result = append(result, entry)
+		}
+	}
+	return result
+}
+
+func setEnvironmentValue(environment []string, name, value string) []string {
+	result := environmentWithoutKeys(environment, name)
+	return append(result, name+"="+value)
+}
+
+func mergeGrantEnvironment(base, overrides []string) []string {
+	result := append([]string(nil), base...)
+	for _, entry := range overrides {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || strings.TrimSpace(key) == "" {
+			continue
+		}
+		result = environmentWithoutKeys(result, key)
+		result = append(result, entry)
+	}
+	return result
 }
 
 func resolveGrantExecutable(ctx context.Context, workspaceRoot, name string) (string, error) {
@@ -203,6 +336,7 @@ func ClassifyCommand(ctx context.Context, workspaceRoot string, segments []strin
 		combined.WritePaths = append(combined.WritePaths, action.WritePaths...)
 		combined.Executable = action.Executable
 		combined.Arguments = append([]string(nil), action.Arguments...)
+		combined.Environment = append([]string(nil), action.Environment...)
 		if action.Summary != "" {
 			if combined.Summary != "" {
 				combined.Summary += "; "
@@ -227,6 +361,16 @@ func ClassifyCommand(ctx context.Context, workspaceRoot string, segments []strin
 	if len(combined.Classes) == 0 {
 		combined.Eligible = false
 		combined.Reasons = append(combined.Reasons, "no_supported_action_class")
+	}
+	if combined.Eligible {
+		if len(combined.Repositories) == 0 {
+			combined.Eligible = false
+			combined.Reasons = append(combined.Reasons, "grant_eligible_action_requires_repository")
+		}
+		if stringSliceContains(combined.Classes, "git_read") && len(combined.Targets) == 0 {
+			combined.Eligible = false
+			combined.Reasons = append(combined.Reasons, "grant_eligible_git_read_requires_target")
+		}
 	}
 	return combined
 }
@@ -257,7 +401,12 @@ func classifySegment(ctx context.Context, workspaceRoot, raw string) Action {
 	if err != nil {
 		return ineligible("cannot_resolve_trusted_executable:" + executable)
 	}
+	executionEnvironment, err := frozenGrantExecutionEnvironment(executable, executablePath)
+	if err != nil {
+		return ineligible("unsafe_grant_execution_environment:" + err.Error())
+	}
 	ctx = withGrantExecutablePath(ctx, executable, executablePath)
+	ctx = withGrantExecutionEnvironment(ctx, executionEnvironment)
 	var action Action
 	switch executable {
 	case "git":
@@ -277,6 +426,7 @@ func classifySegment(ctx context.Context, workspaceRoot, raw string) Action {
 			}
 		}
 		action.Arguments = arguments
+		action.Environment = append([]string(nil), executionEnvironment...)
 	}
 	return action
 }
@@ -634,8 +784,15 @@ func safeGitReadToken(value string) bool {
 }
 
 func classifyGitBranch(ctx context.Context, repo, repoAbs string, args []string) Action {
-	if len(args) == 0 || len(args) == 1 && args[0] == "--show-current" {
-		return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Summary: "git branch read"}
+	if len(args) == 0 {
+		return ineligible("plain_git_branch_read_not_grant_eligible")
+	}
+	if len(args) == 1 && args[0] == "--show-current" {
+		target, err := resolveGitReadTarget(ctx, repoAbs, "")
+		if err != nil {
+			return ineligible("cannot_resolve_git_branch_current_target")
+		}
+		return Action{Eligible: true, Risk: RiskOrdinary, Classes: []string{"git_read"}, Repositories: []string{repo}, Targets: []string{target}, Summary: "git branch --show-current"}
 	}
 	deleteMode := false
 	branches := make([]string, 0)
@@ -1121,7 +1278,7 @@ func resolvePullRequestMetadata(ctx context.Context, repository, selector string
 	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	command := exec.CommandContext(bounded, grantExecutablePath(ctx, "gh"), "pr", "view", selector, "--repo", "github.com/"+repoSlug, "--json", "baseRefName,headRefName")
-	command.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1", "GH_PAGER=")
+	command.Env = mergeGrantEnvironment(grantExecutionEnvironment(ctx), []string{"GH_PROMPT_DISABLED=1", "GH_PAGER="})
 	output, err := command.Output()
 	if err != nil {
 		return pullRequestMetadata{}, err
@@ -1429,15 +1586,11 @@ func resolveGitRemote(ctx context.Context, workspaceRoot, repoAbs, remote string
 		return "", err
 	}
 	if strings.HasPrefix(repository, "github:") {
-		credentialHelpers, configErr := boundedGitOptional(ctx, repoAbs, "config", "--local", "--name-only", "--get-regexp", "^credential\\..*helper$")
-		if configErr != nil {
-			return "", configErr
-		}
-		if strings.TrimSpace(credentialHelpers) != "" {
-			return "", errors.New("repository-local credential helper is not grant eligible")
+		if err := networkCredentialHelperGrantSafety(ctx, repoAbs); err != nil {
+			return "", err
 		}
 		for _, name := range []string{"GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS"} {
-			if strings.TrimSpace(os.Getenv(name)) != "" {
+			if value, _ := environmentValue(grantExecutionEnvironment(ctx), name); strings.TrimSpace(value) != "" {
 				return "", fmt.Errorf("%s is not grant eligible for network remotes", name)
 			}
 		}
@@ -1462,11 +1615,61 @@ func resolveGitRemote(ctx context.Context, workspaceRoot, repoAbs, remote string
 	return repository, nil
 }
 
+func networkCredentialHelperGrantSafety(ctx context.Context, repoAbs string) error {
+	configured, err := boundedGitOptional(ctx, repoAbs, "config", "--show-origin", "--get-all", "credential.helper")
+	if err != nil {
+		return err
+	}
+	configured = strings.TrimSpace(configured)
+	if configured == "" {
+		return nil
+	}
+	lines := strings.Split(strings.ReplaceAll(configured, "\r\n", "\n"), "\n")
+	if runtime.GOOS != "windows" || len(lines) != 1 {
+		return errors.New("configured credential helper is not grant eligible")
+	}
+	origin, helper, ok := strings.Cut(lines[0], "\t")
+	if !ok || strings.TrimSpace(helper) != "manager" || !strings.HasPrefix(origin, "file:") {
+		return errors.New("configured credential helper is not grant eligible")
+	}
+	root, err := trustedGitInstallationRoot(grantExecutablePath(ctx, "git"))
+	if err != nil {
+		return err
+	}
+	originPath := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(strings.TrimSpace(origin), "file:")))
+	expectedConfig := filepath.Clean(filepath.Join(root, "etc", "gitconfig"))
+	if !strings.EqualFold(originPath, expectedConfig) {
+		return errors.New("credential helper must come from the trusted Git system config")
+	}
+	helperPath := filepath.Join(root, "mingw64", "bin", "git-credential-manager.exe")
+	info, err := os.Stat(helperPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return errors.New("trusted Git credential manager is unavailable")
+	}
+	trustedBinary, err := executableHasTrustedBinaryFormat(helperPath)
+	if err != nil {
+		return err
+	}
+	if !trustedBinary {
+		return errors.New("trusted Git credential manager has an unsupported binary format")
+	}
+	return nil
+}
+
 func canonicalRemoteRepository(workspaceRoot, repoAbs, remote string) (string, error) {
 	remote = strings.TrimSpace(remote)
+	if remote == "" {
+		return "", errors.New("empty git remote is not grant eligible")
+	}
+	if strings.Contains(remote, "::") {
+		return "", errors.New("git remote-helper transport syntax is not grant eligible")
+	}
 	lower := strings.ToLower(remote)
 	if strings.HasPrefix(lower, "git@github.com:") {
 		return NormalizeRepository("github:" + remote[len("git@github.com:"):])
+	}
+	if !strings.Contains(remote, "://") && hasAmbiguousGitScpSyntax(remote) {
+		return "", errors.New("ambiguous scp-like git remote is not grant eligible")
 	}
 	if strings.Contains(remote, "://") {
 		parsed, err := url.Parse(remote)
@@ -1523,6 +1726,26 @@ func canonicalRemoteRepository(workspaceRoot, repoAbs, remote string) (string, e
 		return "", err
 	}
 	return NormalizeRepository(filepath.ToSlash(relative))
+}
+
+func hasAmbiguousGitScpSyntax(remote string) bool {
+	colon := strings.IndexByte(remote, ':')
+	if colon <= 0 {
+		return false
+	}
+	if isWindowsAbsoluteDrivePath(remote) {
+		return false
+	}
+	prefix := remote[:colon]
+	return !strings.ContainsAny(prefix, `/\\`)
+}
+
+func isWindowsAbsoluteDrivePath(value string) bool {
+	if len(value) < 3 || value[1] != ':' || value[2] != '/' && value[2] != '\\' {
+		return false
+	}
+	letter := value[0]
+	return letter >= 'A' && letter <= 'Z' || letter >= 'a' && letter <= 'z'
 }
 
 func workspaceRelative(rootAbs, candidateAbs string) (string, error) {
@@ -1603,7 +1826,7 @@ func repositoryGrantSafety(ctx context.Context, workspaceRoot, repoAbs string) e
 	} else if normalized := strings.ToLower(strings.TrimSpace(value)); normalized != "" && normalized != "false" && normalized != "0" {
 		return errors.New("core.fsmonitor is not grant eligible")
 	}
-	if strings.TrimSpace(os.Getenv("GIT_EXTERNAL_DIFF")) != "" {
+	if value, _ := environmentValue(grantExecutionEnvironment(ctx), "GIT_EXTERNAL_DIFF"); strings.TrimSpace(value) != "" {
 		return errors.New("GIT_EXTERNAL_DIFF is not grant eligible")
 	}
 	hooksPath, err := boundedGit(ctx, repoAbs, "rev-parse", "--git-path", "hooks")
@@ -1796,7 +2019,7 @@ func boundedGitWithEnvInput(ctx context.Context, repoAbs string, environment []s
 	defer cancel()
 	commandArgs := append([]string{"-C", repoAbs}, args...)
 	command := exec.CommandContext(bounded, grantExecutablePath(ctx, "git"), commandArgs...)
-	command.Env = append(os.Environ(), environment...)
+	command.Env = mergeGrantEnvironment(grantExecutionEnvironment(ctx), environment)
 	if input != "" {
 		command.Stdin = strings.NewReader(input)
 	}
@@ -1836,7 +2059,9 @@ func boundedGit(ctx context.Context, repoAbs string, args ...string) (string, er
 	bounded, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	commandArgs := append([]string{"-C", repoAbs}, args...)
-	output, err := exec.CommandContext(bounded, grantExecutablePath(ctx, "git"), commandArgs...).Output()
+	command := exec.CommandContext(bounded, grantExecutablePath(ctx, "git"), commandArgs...)
+	command.Env = grantExecutionEnvironment(ctx)
+	output, err := command.Output()
 	if err != nil {
 		return "", err
 	}
