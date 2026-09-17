@@ -4,7 +4,7 @@
 
 - Intent source: `EXPLICIT` — `richarsun/personal-ai-ops#861`
 - Change level: L3（公共授权协议与安全边界）
-- Candidate state: M1 integrated baseline complete; third-round NEEDS_FIX Stage V1 convergence under implementation
+- Candidate state: M1 integrated; third-round Stage V1 fixes verified, unrelated deployed PR #4 baseline full-test failure recorded; freeze/delivery/independent review pending
 - Deployment state: not deployed, not released
 
 ## Why

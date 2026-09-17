@@ -36,11 +36,11 @@
 - [x] 同一独立 Reviewer 对 `83921e3` 第三轮复审返回 NEEDS_FIX：POSIX `C:/repo` 盘符解释、URL-specific credential helper、SSH config execution surface、branch/tag/object revision ambiguity 共 4 个 P1；旧 PASS/NEEDS_FIX 历史不改写。
 - [x] M1 将包含 PR #2 的当前 deployed confirmation-recovery head `3ab65746753924ce5b31c6a9996c94c1365bba6b` 机械整合进 PR #3 lineage，形成本地 merge commit `f190d591c1970acaa0c80c969d055c366a073bda`；保留双方历史，未 push、未合 main、未部署。
 - [x] 正式记录 Stage V1 收窄合同：Windows 单账号/单 Session/Workspace/repository + GitHub HTTPS；SSH、超出窄模型的 credential helper 与歧义 revision 均 grant-ineligible / fallback to existing confirmation。
-- [ ] P1-1：Windows drive-path 例外平台化；POSIX `C:/repo` 在 SSH/helper side effect 前 fail-closed，并补 Linux fetch/push marker 与 Windows local-path 回归。
-- [ ] P1-2：实现窄 credential-helper 模型；覆盖 URL-specific/reset/multiple/shell/absolute/unknown source 与 `GIT_CONFIG_*` 注入，并保留 trusted Windows system manager 正例。
-- [ ] P1-3：Stage V1 所有 SSH/scp remote 不复用 grant；覆盖 canonical scp、`ssh://` 与恶意 ssh_config marker。
-- [ ] P1-4：revision 只 grant 默认 HEAD、显式 `refs/heads/...`、verified full OID；bare ambiguous revision fallback，并让 actual argv 使用 canonical ref/OID。
-- [ ] 运行第三轮 4 P1 行为回归、Windows authorization/Runtime、Linux authorization/full test、affected race、static/build/vet/CGO=0 与 OpenSpec strict；无关历史失败单独保留。
+- [x] P1-1：Windows drive-path 例外已平台化；POSIX `C:/repo` 在 local normalization 前按 scp-like remote fail-closed，Linux lookalike bare repo + fetch/push + SSH marker 回归通过；Windows 合法 drive-absolute local remote 正路继续由既有 local fetch 回归覆盖。
+- [x] P1-2：credential-helper 已收窄为无 helper 或 Windows 同一受信任 Git 安装的唯一 system `credential.helper=manager`；URL-specific、empty reset、multiple、shell、absolute/custom、来源不可证明及 `GIT_CONFIG_*` 注入均 fail-closed；canonical GitHub HTTPS 正向分类在 Windows/Linux 均通过。
+- [x] P1-3：Stage V1 canonical scp 与 `ssh://` remote 均 grant-ineligible / fallback ordinary confirmation；恶意 ssh_config/marker 未经 grant classification 执行。
+- [x] P1-4：git_read target 已收窄为 default HEAD、显式 `refs/heads/...` 与 verified full OID；bare symbolic revision fallback，full OID 在同名 40-hex ref 前按 object identity 校验，actual argv 使用 canonical ref/OID；branch/tag/OID ambiguity 与 narrow alias 回归通过。
+- [x] 第三轮验证完成：Windows P1 focused PASS 30.054s、target ambiguity PASS 12.720s、最新 exact worktree `internal/authorization` PASS 114.205s、`TestConversationAuthorization*` PASS 51.934s、HTTPS 正向 PASS 4.510s；Linux authorization 当前树 PASS 10.130s；affected race PASS（authorization 10.618s、server 351.021s）；diff-check、普通 build、vet、CGO=0 build exit 0；OpenSpec strict PASS。Linux `go test ./... -count=1` 唯一 FAIL 为 `TestReviewCancelStopsGrandchildEffects/parent-exits`，current candidate 重复 5/5 FAIL，deployed PR #4 exact `3ab6574` 重复 3/3 同样 FAIL，确认是既有 PR #4 baseline，未声明 full-test PASS。
 - [ ] 冻结最终 integrated exact commit/tree，确认 worktree/staged clean 与 `83921e3..new-head` delta 后正常 fast-forward push PR #3 branch，并回写 Draft PR/#861/#823；必要时再同步中央 #824 OpenSpec。
 - [ ] 由同一独立 Reviewer 对最终 exact candidate、`83921e3..new-head`、4 P1 原失败机制、四条安全不变量和 M1 integration 给出新 PASS/NEEDS_FIX；PASS 前保持 Draft/review-required。
 - [x] 不部署、不发布；只有后续新的明确授权才进入发行阶段。
