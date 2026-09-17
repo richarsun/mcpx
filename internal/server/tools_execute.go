@@ -49,6 +49,21 @@ func (r *Runtime) cleanExecuteReadyForIdempotency(ctx context.Context, req *mcp.
 	if fail != nil {
 		return false
 	}
+	// A completed durable record must be resolved before current semantic
+	// preflight. This preserves exact retry/recovery after a grant is narrowed,
+	// revoked, or expires while still making changed payloads conflict by their
+	// authorization-aware fingerprint.
+	key := idempotency.Key{
+		RemoteSessionID: remote.ID,
+		PrincipalID:     principal.ID,
+		Operation:       "execute",
+		Value:           strings.TrimSpace(stringPayload(envReq.Payload, "idempotency_key")),
+	}
+	if r.idempotency != nil {
+		if _, err := r.idempotency.Get(ctx, key); err == nil {
+			return true
+		}
+	}
 	purpose, scope, intentErr := commandIntent(envReq)
 	if intentErr != nil {
 		return false
@@ -58,7 +73,14 @@ func (r *Runtime) cleanExecuteReadyForIdempotency(ctx context.Context, req *mcp.
 		return false
 	}
 	command := strings.TrimSpace(stringPayload(envReq.Payload, "command"))
-	payloadDigest := ""
+	argvSpec, argvDisplay, argvDigest, argvErr := executeArgv(envReq.Payload)
+	if argvErr != nil {
+		return false
+	}
+	if argvSpec != nil {
+		command = argvDisplay
+	}
+	payloadDigest := argvDigest
 	if runtimeSpec != nil {
 		command = runtimeSpec.Command
 		payloadDigest = runtimeSpec.ScriptSHA256
@@ -75,27 +97,40 @@ func (r *Runtime) cleanExecuteReadyForIdempotency(ctx context.Context, req *mcp.
 	if command == "" {
 		return false
 	}
-	decision := security.MatchCommand(r.effectiveConfig(remote.WorkspacePath).Security.Commands, command)
-	if decision == security.Deny {
+	analysis := security.AnalyzeCommand(r.effectiveConfig(remote.WorkspacePath).Security.Commands, command)
+	if analysis.Decision == security.Deny {
 		return false
 	}
-	if decision != security.Confirm {
-		return true
-	}
-	if !boolPayload(envReq.Payload, "user_confirmed") {
+	authorizationState, authorizationErr := r.evaluateCommandAuthorization(
+		ctx, envReq.Payload, principal, remote, command, purpose, analysis,
+	)
+	if authorizationErr != nil {
 		return false
+	}
+	if authorizationState.Request != nil {
+		payloadDigest = combinedCommandPayloadDigest(payloadDigest, authorizationState.RequestDigest)
 	}
 	digest := commandRequestDigestWithPayload(envReq.RequestID, remote.ID, remote.WorkspaceName, command, purpose, scope, payloadDigest)
-	if _, ok := r.pendingCommandConfirmation(remote.ID, principal.ID, command, scope, digest); ok {
+	if authorizationState.Request != nil {
+		if !boolPayload(envReq.Payload, "user_confirmed") {
+			return false
+		}
+		if _, ok := r.pendingCommandConfirmation(remote.ID, principal.ID, command, scope, digest); ok {
+			return true
+		}
+	} else if authorizationState.matchedGrant() {
 		return true
+	} else if analysis.Decision != security.Confirm {
+		return true
+	} else {
+		if !boolPayload(envReq.Payload, "user_confirmed") {
+			return false
+		}
+		if _, ok := r.pendingCommandConfirmation(remote.ID, principal.ID, command, scope, digest); ok {
+			return true
+		}
 	}
-	// After the approval is consumed, an idempotent retry must still reach
-	// Claim so it can replay the durable result instead of creating a fresh
-	// confirmation request. A pre-existing record also lets Claim return the
-	// correct conflict when the caller changed business parameters.
-	key := idempotency.Key{RemoteSessionID: remote.ID, PrincipalID: principal.ID, Operation: "execute", Value: stringPayload(envReq.Payload, "idempotency_key")}
-	_, err := r.idempotency.Get(ctx, key)
-	return err == nil
+	return false
 }
 
 // toolObserveTask routes task-specific status and logs without exposing the

@@ -1,14 +1,11 @@
 package terminal
 
 import (
-	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-
-	"mcpx/internal/winproc"
 )
 
 // ExecutionShell returns the shell used for command-string execution.
@@ -41,16 +38,6 @@ func ExecutionShell() string {
 		return candidate
 	}
 	return "/bin/bash"
-}
-
-func commandShell(ctx context.Context, command string) *exec.Cmd {
-	if runtime.GOOS == "windows" {
-		cmd := exec.CommandContext(ctx, "cmd", "/C", command)
-		// Windows 下隐藏命令窗口，避免后台任务启动时打扰用户桌面。
-		winproc.ConfigureNoWindow(cmd)
-		return cmd
-	}
-	return exec.CommandContext(ctx, ExecutionShell(), "-lc", command)
 }
 
 func executableFile(path string) bool {

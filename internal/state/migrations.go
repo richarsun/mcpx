@@ -451,6 +451,101 @@ var migrations = []string{
 	CREATE INDEX IF NOT EXISTS idx_agent_activity_turns_session_seen
 		ON agent_activity_turns(remote_session_id, seen_at DESC);`,
 	`ALTER TABLE terminal_tasks ADD COLUMN limit_reason TEXT NOT NULL DEFAULT '';`,
+	`ALTER TABLE operations ADD COLUMN state_sequence INTEGER NOT NULL DEFAULT 1;
+	ALTER TABLE operations ADD COLUMN run_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE operations ADD COLUMN submission_sha256 TEXT NOT NULL DEFAULT '';
+	UPDATE operations SET run_id=id;
+	CREATE TABLE operation_submissions (
+		operation_id TEXT PRIMARY KEY,
+		remote_session_id TEXT NOT NULL,
+		submission_sha256 TEXT NOT NULL,
+		FOREIGN KEY(remote_session_id) REFERENCES remote_sessions(id) ON DELETE CASCADE
+	);
+	INSERT INTO operation_submissions SELECT id, remote_session_id, submission_sha256 FROM operations;
+	CREATE TABLE workspace_run_identities (
+		run_id TEXT PRIMARY KEY,
+		remote_session_id TEXT NOT NULL,
+		identity_json TEXT NOT NULL,
+		version INTEGER NOT NULL DEFAULT 1,
+		FOREIGN KEY(remote_session_id) REFERENCES remote_sessions(id) ON DELETE CASCADE
+	);
+	CREATE TABLE workspace_identity_transitions (
+		run_id TEXT NOT NULL,
+		operation_id TEXT NOT NULL,
+		remote_session_id TEXT NOT NULL,
+		before_json TEXT NOT NULL,
+		after_json TEXT NOT NULL,
+		command TEXT NOT NULL,
+		task_id TEXT NOT NULL DEFAULT '',
+		phase TEXT NOT NULL DEFAULT 'pending',
+		PRIMARY KEY(run_id,operation_id),
+		FOREIGN KEY(run_id) REFERENCES workspace_run_identities(run_id) ON DELETE CASCADE
+	);
+	CREATE UNIQUE INDEX workspace_one_pending_transition ON workspace_identity_transitions(run_id) WHERE phase='pending';
+	ALTER TABLE operations ADD COLUMN state_event_id TEXT NOT NULL DEFAULT '';
+	UPDATE operations SET state_event_id = 'operation:' || hex(id) || ':1';
+	CREATE TRIGGER operations_initial_state_event AFTER INSERT ON operations
+	BEGIN
+		UPDATE operations SET state_event_id = 'operation:' || hex(NEW.id) || ':1', state_sequence = 1 WHERE id = NEW.id;
+	END;
+	CREATE TRIGGER operations_state_event AFTER UPDATE OF state ON operations
+	WHEN NEW.state != OLD.state
+	BEGIN
+		UPDATE operations SET state_sequence = OLD.state_sequence + 1,
+			state_event_id = 'operation:' || hex(NEW.id) || ':' || (OLD.state_sequence + 1)
+			WHERE id = NEW.id;
+	END;
+	CREATE TRIGGER operations_terminal_immutable BEFORE UPDATE OF state ON operations
+	WHEN OLD.state IN ('succeeded','failed','interrupted','cancelled') AND NEW.state != OLD.state
+	BEGIN
+		SELECT RAISE(ABORT, 'operation terminal state is immutable');
+	END;
+	CREATE TRIGGER operation_steps_initial_version AFTER INSERT ON operation_steps
+	BEGIN
+		UPDATE operations SET state_sequence = state_sequence + 1,
+			state_event_id = 'operation:' || hex(id) || ':' || (state_sequence + 1)
+			WHERE id = NEW.operation_id AND state NOT IN ('succeeded','failed','interrupted','cancelled');
+	END;
+	CREATE TRIGGER operation_steps_changed_version AFTER UPDATE ON operation_steps
+	WHEN NEW.state != OLD.state OR NEW.result_json != OLD.result_json OR NEW.error_json != OLD.error_json
+		OR NEW.confirmation_token != OLD.confirmation_token
+	BEGIN
+		UPDATE operations SET state_sequence = state_sequence + 1,
+			state_event_id = 'operation:' || hex(id) || ':' || (state_sequence + 1)
+			WHERE id = NEW.operation_id AND state NOT IN ('succeeded','failed','interrupted','cancelled');
+	END;`,
+	`CREATE TABLE IF NOT EXISTS authorization_grants (
+		id TEXT PRIMARY KEY,
+		remote_session_id TEXT NOT NULL,
+		workspace_name TEXT NOT NULL,
+		principal_id TEXT NOT NULL,
+		authorization_context_id TEXT NOT NULL,
+		work_package_id TEXT NOT NULL,
+		goal TEXT NOT NULL,
+		scope_json TEXT NOT NULL,
+		scope_digest TEXT NOT NULL,
+		grant_digest TEXT NOT NULL,
+		status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'superseded', 'expired')),
+		source_request_id TEXT NOT NULL,
+		source_command_digest TEXT NOT NULL,
+		supersedes_grant_id TEXT,
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		revoked_at INTEGER,
+		revocation_reason TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY (remote_session_id) REFERENCES remote_sessions(id) ON DELETE CASCADE,
+		FOREIGN KEY (supersedes_grant_id) REFERENCES authorization_grants(id)
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS uq_authorization_grants_active_scope
+		ON authorization_grants(remote_session_id, workspace_name, principal_id,
+			authorization_context_id, work_package_id, goal, scope_digest)
+		WHERE status = 'active';
+	CREATE INDEX IF NOT EXISTS idx_authorization_grants_context
+		ON authorization_grants(remote_session_id, workspace_name, principal_id,
+			authorization_context_id, status, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_authorization_grants_expiry
+		ON authorization_grants(status, expires_at);`,
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB) error {

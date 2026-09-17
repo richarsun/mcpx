@@ -47,12 +47,14 @@ func (r *Runtime) toolSession(ctx context.Context, req *mcp.CallToolRequest) (*m
 		return r.toolRemoteSessionList(ctx, req)
 	case "close":
 		return r.toolRemoteSessionClose(ctx, req)
+	case "authorization_list", "authorization_revoke", "authorization_narrow":
+		return r.toolAuthorizationLifecycle(ctx, req, action)
 	default:
 		envReq, _, fail := r.remoteRequest(ctx, req)
 		if fail != nil {
 			return fail, nil
 		}
-		return r.terminalError(envReq, envReq.RemoteSessionID, envReq.Workspace, "bad_request", "action must be open, list, or close")
+		return r.terminalError(envReq, envReq.RemoteSessionID, envReq.Workspace, "bad_request", "action must be open, list, close, authorization_list, authorization_revoke, or authorization_narrow")
 	}
 }
 

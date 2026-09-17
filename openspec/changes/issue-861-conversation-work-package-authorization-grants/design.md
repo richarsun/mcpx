@@ -1,0 +1,124 @@
+# Design: Conversation Work-Package Authorization Grants
+
+## 1. Data Model
+
+`authorization_grants` 持久化以下不可缺失的绑定：
+
+- `principal_id`
+- `authorization_context_id`
+- `remote_session_id`
+- `workspace_name`
+- `work_package_id` 与 `goal`
+- 规范化 scope：`purpose_patterns`、`action_classes`、精确 repository identities、target patterns、write paths、`risk_ceiling`
+- `scope_digest`、`grant_digest`
+- `status`：active / revoked / superseded / expired
+- source request/command digests、创建/更新/过期/撤销时间和 supersedes 关系
+
+同一 principal/context/session/workspace/work-package/goal/scope 只允许一个 active grant。稳定 digest 使用规范化字段生成，不包含 transport request ID。
+
+## 2. Activation Protocol
+
+`execute(action=run)` 增加三个可选字段：
+
+- `authorization_context_id`
+- `authorization_grant_id`
+- `authorization_request`
+
+客户端首次提出 `authorization_request` 时，Runtime 对当前命令完成策略分析和 scope 匹配，但仍要求原 exact-command confirmation。确认重试时，Runtime 校验同一个服务端 pending digest，再原子创建或恢复 grant。后续命令只携带 context + grant ID。
+
+新对话必须使用新的 context ID；session open 只有在调用方显式提供 context 时才返回对应 grant，不自动把旧 conversation grant 注入新对话。
+
+## 3. Policy and Matching Order
+
+每个动作按以下顺序处理：
+
+1. 运行现有安全策略。
+2. Deny 立即终止，grant 无权覆盖。
+3. 保守分类命令，得到风险、动作类别、实际 repository identity、targets 和 write paths。
+4. 按 principal/context/Remote Session/Workspace 读取绑定 grant。
+5. 检查 active/expiry、purpose、risk、classes、repositories、targets、write paths。
+6. 只有策略为 Confirm 且匹配时，grant 才跳过逐命令 confirmation；Allow 动作不需要 grant 放权，但在提供 grant 时记录匹配结果。
+
+Repository identity 逐项精确匹配；purpose/target 使用受限 glob；write path 使用 slash-aware 的保守覆盖判定。无法证明为子集或在 Workspace 内的路径一律不匹配。
+
+## 4. Conservative Command Classification
+
+首版 allowlist 只覆盖可机器证明的普通 Git/GitHub 形态：
+
+- Git read：status、受限 diff/log/show/rev-parse
+- Git remote read：显式 remote + ref 的 fetch
+- Git local write：受限 switch、显式 add、非交互 commit
+- Git remote write：非 force、非删除、非 upstream 变更、非 hooks 绕过的 push
+- GitHub PR：受限 create/view/merge，要求显式 repo/PR selector 与非交互参数
+- 安全 cleanup：`git branch -d`
+
+以下情况 grant-ineligible 并回到现有策略：未知/compound command、external diff/textconv、外部输出、hooks/submodule/filter 执行面、force/delete/reset/clean、credential/secret/auth、production/payment/system-network/service、永久删除，以及 `go test/vet/build` 等可能执行仓库代码的验证命令。
+
+### 4.1 Grant reuse 安全不变量
+
+第二轮独立 Review 证明，仅对已知 argv 形态逐点封堵不足以证明授权复用安全。首版 Git grant reuse 必须同时满足以下四条不变量；任一条无法证明时动作必须 grant-ineligible，并回到原逐命令策略：
+
+1. **Remote identity invariant**：分类器规范化出的 repository identity 必须与 Git 实际执行时对 remote 字符串的 transport 解释唯一且一致。`<transport>::<address>` 与 SSH/scp-like `host:path` / `user@host:path` 不得先按 Workspace 本地路径归一化；Stage V1 所有 SSH/scp remote 一律 grant-ineligible。Windows 绝对盘符路径例外只在 Windows 生效；POSIX 上 `C:/repo` 等 colon form 不得套用 Windows local-path 规则。
+2. **Execution-surface invariant**：grant 绑定的不只是顶层 executable 与 argv，还包括会改变 Git 子程序、transport 与 config/helper 解析的关键执行环境。非空 `GIT_EXEC_PATH` 以及未建模的 `GIT_CONFIG_*` 等 config source/injection 环境不得参与 grant reuse；分类探测与真正 grant-backed 执行必须使用同一冻结环境语义。Grant-backed Git 的 PATH 必须由已验证 Git 安装派生，不继承任意宿主 PATH shadow。
+3. **Target-completeness invariant**：所有 grant-eligible `git_read` 必须具有非空、规范化且可匹配的 `Action.Targets`，并且 target 的分类解释必须唯一。Stage V1 只支持默认 HEAD、显式 `refs/heads/<name>` 与已验证 full object ID；裸 symbolic revision、range、detached/未知 target 或 plain `git branch` grant-ineligible。
+4. **Classification/execution equivalence**：分类阶段批准的 executable、argv、environment、repository 与 target 语义必须约束实际进程。经验证的 revision 必须以 canonical ref/OID 写回实际执行 argv，不得一边分类为 `refs/heads/main` 一边执行裸 `main`；不得因 transport/helper/config/environment 在执行阶段扩张。
+
+实现与测试必须对全部 grant-eligible Git action 做 surface audit：需要 repository scope 的动作不得产生空 repository；需要 target scope 的 `git_read` 不得产生空 target；remote/helper/config 与 child-program 语义不得依赖分类阶段未冻结的环境。
+
+### 4.2 Stage V1 第三轮收窄
+
+#### A. Platform-specific remote interpretation
+
+Windows drive-absolute 例外只在 `runtime.GOOS == "windows"` 时成立。POSIX 上 `C:/repo` 可能被 Git 解释为 SSH `host:path`，所以必须在 local normalization、SSH/helper 探测或任何副作用之前 fail-closed。Windows 合法 drive absolute local repository 仍可按既有 Workspace/path 边界进入正向分类。
+
+#### B. Narrow credential-helper model
+
+Stage V1 不实现完整 Git credential matching engine。对 GitHub HTTPS remote，generic helper 只允许无 helper 或 Windows 下唯一、来源可证明为同一受信任 Git for Windows system config 的 `credential.helper=manager`，且对应 helper binary 可验证属于同一安装树。URL-specific helper 仅允许下文 2026-09-17 增量定义的 Windows GitHub CLI 固定凭据链。
+
+除下文 Windows GitHub CLI 固定凭据链外，发现任一以下形态即 grant-ineligible 并回到 ordinary confirmation：`credential.<url>.helper`、empty reset、multiple helpers、`!shell` helper、absolute/custom helper、来源不可证明 helper，或会改变 Git config 来源/注入的未冻结 `GIT_CONFIG_*` 环境。分类阶段不得先运行这些 helper 来判断是否安全。
+
+#### C. SSH transport boundary
+
+Stage V1 唯一 remote grant 正向路径是 GitHub HTTPS。所有 `git@github.com:...`、其他 scp-like remote 与 `ssh://...` 均 grant-ineligible；SSH 本身不被禁止，继续走现有逐命令确认。Runtime 不尝试解析或隔离 user/system `ssh_config`、`HostName`、`ProxyCommand`、`Match exec` 或 `Include`，grant 分类与 grant-backed 执行都不得触发其中副作用。
+
+#### D. Canonical revision execution
+
+Stage V1 revision 正向只支持默认 HEAD、显式 `refs/heads/<name>` 与经 Git 验证存在的 full object ID。裸 symbolic revision（如 `main`）、`HEAD~1`、range 等无法证明唯一解释的输入 grant-ineligible。Full OID 必须先按 object identity 验证，不能因为存在同名 branch/ref 而误分类；branch/tag 同名时裸名不得进入 grant。Grant narrow 后不得通过 bare/tag/OID alias 恢复已移出 scope 的 target。
+
+## 5. Lifecycle
+
+- `authorization_list`：按当前 identity/context 列出 active 或包含 inactive 历史。
+- `authorization_revoke`：原子标记 revoked；重复调用返回同一终态。
+- `authorization_narrow`：旧 grant 原子 supersede，新 grant 使用新 ID/digest；只允许 scope 真子集和/或更早 expiry，不允许任何维度扩张或延长。
+- expiry：读取或写入时惰性转换为 expired。
+
+所有生命周期调用都要求当前 principal、Remote Session、Workspace 和 context 与 grant 绑定一致。
+
+## 6. Audit and Idempotency
+
+执行响应与 command audit detail 记录：
+
+- decision（created / reused / matched policy allow / mismatch / absent）
+- grant ID/digest、source request/command digest
+- 当前 action 分类
+- matched、match basis 或具体 mismatch reasons
+- grant 是否真正用于 confirmation bypass
+
+授权 context、grant、request 以及授权调用的 purpose 参与幂等 fingerprint；transport confirmation metadata 不参与。已完成的 durable idempotency record 在当前 grant 被 narrow/revoke/expire 后仍可精确重放；改变 purpose、context、grant、request 或业务参数则返回 conflict。
+
+## 7. Recovery and Compatibility
+
+SQLite migration 创建 grant 表与唯一 active-scope/index 约束。Create/retry、narrow retry 和 revoke retry 均为幂等。旧客户端不提供任何 authorization 字段时继续使用原策略和逐命令确认，协议为向后兼容的 opt-in。
+
+## 8. Independent Strong Protocols
+
+`move_out` schema 不增加 authorization 字段，submit 仍必须使用 prepare 返回的服务端 confirmation UUID。普通 grant 永远不能替代或消费该强确认协议。
+
+
+## 2026-09-17 获准增量：当前 Windows GitHub CLI helper
+
+真人已批准原实施停止后由当前 Codex 接手四步：支持现有 helper、正常 HOME 验证、独立复审、本机部署与真实闭环。此增量只新增下面的窄例外，替代前文“所有 URL-specific helper 均回确认 / system manager 是唯一正例”的绝对表述；其他未知 helper、SSH、注入和高风险边界不变。
+
+只接受 Windows 的 canonical GitHub HTTPS remote。有效 generic helper 仍限无 helper 或原可信 system manager。URL-specific helper 仅接受 global 用户 .gitconfig 中精确的 `credential.https://github.com.helper`，依次为空 reset 和单个 `!'受信任安装绝对路径/gh.exe' auth git-credential`；可共存同形的 gist.github.com 配置。可信 gh 必须通过既有安装位置、符号链接解析、regular file 和 PE 格式校验；只接受固定命令，不执行 helper 做探测。额外参数、shell 片段、更多 helper、路径/主机变体、repo/worktree/include 来源及 GIT_CONFIG_* 注入全部回确认。每个动作重新核对有效配置与可执行身份，不修改用户配置，不复制或输出凭据。
+
+正常 HOME 的 fetch/push 分类正例与隔离负例分别留证；模拟通过不能代签真实网络、grant 复用、撤销和幂等验收。源码复审必须绑定新 exact candidate。部署仅限 controller-win-01，独立审核和完整制品/回滚准备之前不替换运行物；不 merge main/Tag/Release，不处理其他遗留问题。

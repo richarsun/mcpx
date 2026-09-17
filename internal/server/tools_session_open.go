@@ -10,12 +10,15 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"mcpx/internal/audit"
+	"mcpx/internal/authorization"
+	workspacefile "mcpx/internal/file"
 	"mcpx/internal/instruction"
 	"mcpx/internal/observation"
 	"mcpx/internal/projecttask"
 	"mcpx/internal/remotesession"
 	"mcpx/internal/skill"
 	buildversion "mcpx/internal/version"
+	workspaceidentity "mcpx/internal/workspace"
 )
 
 // toolSessionOpen creates or reuses a Remote Session and returns a full bootstrap bundle
@@ -45,6 +48,14 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	if workspaceName == "" {
 		workspaceName, _ = envReq.Payload["workspace"].(string)
 	}
+	authorizationContextID := strings.TrimSpace(stringPayload(envReq.Payload, "authorization_context_id"))
+	if authorizationContextID != "" {
+		normalizedContextID, err := authorization.NormalizeContextID(authorizationContextID)
+		if err != nil {
+			return r.terminalError(envReq, remoteID, workspaceName, "bad_request", err.Error())
+		}
+		authorizationContextID = normalizedContextID
+	}
 	if remoteID != "" {
 		existing, err := r.remote.Get(ctx, principal, remoteID)
 		if err != nil {
@@ -61,6 +72,32 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	}
 
 	wsPath := session.WorkspacePath
+	var gitIdentity *workspaceidentity.GitIdentity
+	if runID := stringPayload(envReq.Payload, "run_id"); runID != "" || stringPayload(envReq.Payload, "git_identity_path") != "" {
+		if err := r.reconcileWorkspaceTransition(ctx, session.ID, runID); err != nil {
+			return r.terminalError(envReq, session.ID, session.WorkspaceName, "WORKSPACE_TRANSITION_UNVERIFIED", err.Error())
+		}
+		identityPath := stringPayload(envReq.Payload, "git_identity_path")
+		if identityPath == "" {
+			identityPath = "."
+		}
+		resolved, err := workspacefile.Resolve(wsPath, identityPath)
+		if err != nil {
+			return r.terminalError(envReq, session.ID, session.WorkspaceName, "WORKSPACE_IDENTITY_UNAVAILABLE", "identity target must be inside registered workspace")
+		}
+		remoteName := stringPayload(envReq.Payload, "remote_name")
+		if remoteName == "" {
+			remoteName = "origin"
+		}
+		identity, err := workspaceidentity.CaptureGitIdentity(ctx, resolved, remoteName, runID)
+		if err != nil {
+			return r.terminalError(envReq, session.ID, session.WorkspaceName, "WORKSPACE_IDENTITY_UNAVAILABLE", err.Error())
+		}
+		if err := workspaceidentity.FreezeGitIdentity(ctx, r.state.DB(), session.ID, identity); err != nil {
+			return r.terminalError(envReq, session.ID, session.WorkspaceName, "WORKSPACE_IDENTITY_MISMATCH", err.Error())
+		}
+		gitIdentity = &identity
+	}
 	effective := r.effectiveConfig(wsPath)
 	tools := r.runtimeToolCapabilities(effective, &session)
 
@@ -75,10 +112,12 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 		taskList             any
 		artifacts            any
 		latestModelState     any
+		authorizationGrants  []map[string]any
+		authorizationErr     error
 	)
 	var tasks any
 	var bootstrap sync.WaitGroup
-	bootstrap.Add(7)
+	bootstrap.Add(8)
 	go func() {
 		defer bootstrap.Done()
 		if manager, err := r.mcpManagerForWorkspace(wsPath); err == nil && effective.Discovery.MCP.Enabled {
@@ -117,6 +156,27 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	}()
 	go func() {
 		defer bootstrap.Done()
+		if authorizationContextID == "" {
+			return
+		}
+		if r.authorizations == nil {
+			authorizationErr = fmt.Errorf("authorization grant store is unavailable")
+			return
+		}
+		grants, err := r.authorizations.List(ctx, authorization.BoundIdentity{
+			RemoteSessionID: session.ID,
+			Workspace:       session.WorkspaceName,
+			PrincipalID:     principal.ID,
+			ContextID:       authorizationContextID,
+		}, false, time.Now().UTC())
+		if err != nil {
+			authorizationErr = err
+			return
+		}
+		authorizationGrants = authorizationPublicViews(grants)
+	}()
+	go func() {
+		defer bootstrap.Done()
 		if r.observation == nil || r.observation.store == nil {
 			return
 		}
@@ -131,6 +191,9 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 		}
 	}()
 	bootstrap.Wait()
+	if authorizationErr != nil {
+		return r.terminalErrorForContext(ctx, envReq, session.ID, session.WorkspaceName, "authorization_store_error", authorizationErr.Error())
+	}
 
 	var instructionPayload any
 	if includeInstrContent {
@@ -200,6 +263,17 @@ func (r *Runtime) toolSessionOpen(ctx context.Context, req *mcp.CallToolRequest)
 	}
 	if latestModelState != nil {
 		data["latest_model_state"] = latestModelState
+	}
+	if authorizationContextID != "" {
+		data["authorization_context_id"] = authorizationContextID
+		data["authorization_grants"] = authorizationGrants
+		data["authorization_recovery"] = map[string]any{
+			"active_grant_count": len(authorizationGrants),
+			"binding":            "principal+authorization_context+remote_session+workspace",
+		}
+	}
+	if gitIdentity != nil {
+		data["git_identity"] = gitIdentity
 	}
 
 	r.logAudit(audit.Event{

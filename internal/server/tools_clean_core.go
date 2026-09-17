@@ -110,19 +110,32 @@ func (r *Runtime) registerCleanCoreTools(s *mcp.Server) {
 	r.addTool(s, cleanCoreTool("workspace", desc["workspace"], map[string]any{}, nil, readOnlyToolAnnotation), r.toolWorkspace)
 
 	r.addTool(s, cleanCoreTool("session", desc["session"], map[string]any{
-		"remote_session_id":            remoteSession,
-		"action":                       enumSchema("会话生命周期动作；省略时默认 open/resume，传 mode 时可省略并推导 close；remote_session_id 丢失时显式 list 发现已有会话", "open", "list", "close"),
-		"workspace":                    workspace,
-		"query":                        stringSchema("list 时按 label、description 或 Session ID 搜索"),
-		"status":                       stringSchema("list 时按状态过滤；多个状态用逗号分隔"),
-		"cursor":                       stringSchema("list 分页游标"),
-		"limit":                        numberSchema("list 返回数量限制"),
-		"label":                        stringSchema("会话标签"),
-		"description":                  stringSchema("开发目标或会话描述"),
-		"client_request_id":            stringSchema("客户端幂等键"),
-		"include_instructions_content": booleanSchema("是否内联返回指令内容"),
-		"include_project_tasks":        booleanSchema("是否返回项目任务"),
-		"mode":                         enumSchema("关闭模式；出现时省略 action 也会推导 close", "closed", "archived"),
+		"remote_session_id":              remoteSession,
+		"action":                         enumSchema("会话、Git 身份或对话级授权生命周期动作；省略时默认 open/resume，传 mode 时可省略并推导 close；remote_session_id 丢失时显式 list 发现已有会话", "open", "list", "close", "authorization_list", "authorization_revoke", "authorization_narrow"),
+		"workspace":                      workspace,
+		"query":                          stringSchema("list 时按 label、description 或 Session ID 搜索"),
+		"status":                         stringSchema("list 时按状态过滤；多个状态用逗号分隔"),
+		"cursor":                         stringSchema("list 分页游标"),
+		"limit":                          numberSchema("list 返回数量限制"),
+		"label":                          stringSchema("会话标签"),
+		"description":                    stringSchema("开发目标或会话描述"),
+		"client_request_id":              stringSchema("客户端幂等键"),
+		"include_instructions_content":   booleanSchema("是否内联返回指令内容"),
+		"include_project_tasks":          booleanSchema("是否返回项目任务"),
+		"run_id":                         stringSchema("显式请求 Git 身份快照的稳定运行 ID"),
+		"git_identity_path":              stringSchema("Git root 相对 Workspace 的路径；run_id 存在时默认根目录"),
+		"remote_name":                    stringSchema("身份快照的远端名称，默认 origin"),
+		"mode":                           enumSchema("关闭模式；出现时省略 action 也会推导 close", "closed", "archived"),
+		"purpose":                        stringSchema("撤销或缩小授权的用户可见目的；authorization_list 不需要"),
+		"authorization_context_id":       stringSchema("当前 Chat 对话/授权上下文的稳定 ID；新对话不得复用旧 ID"),
+		"authorization_grant_id":         stringSchema("待撤销或缩小的 grant ID"),
+		"authorization_include_inactive": booleanSchema("authorization_list 是否包含已撤销、已替代和已过期历史"),
+		"authorization_reason":           stringSchema("撤销或缩小授权的审计原因；省略时使用 purpose"),
+		"authorization_scope":            authorizationScopeInputSchema("缩小后的完整授权边界；不得扩大任一维度"),
+		"authorization_expires_at": map[string]any{
+			"type": "string", "format": "date-time",
+			"description": "缩小授权的新到期时间（RFC3339）；不得晚于原 grant",
+		},
 	}, nil, sessionToolAnnotation), r.toolSession)
 
 	readItems := arraySchema(map[string]any{
@@ -174,11 +187,22 @@ func (r *Runtime) registerCleanCoreTools(s *mcp.Server) {
 		"type":                 "object",
 		"additionalProperties": false,
 		"properties": map[string]any{
-			"path":        path,
-			"operation":   enumSchema("文件操作；用户提出删除、移除或清理时请使用 move_out(action=prepare)，确认后再 move_out(action=submit)", "create", "update", "rename"),
-			"base_sha256": stringSchema("读取时获得的文件 sha256"),
-			"content":     stringSchema("新文件的完整内容"),
-			"new_path":    stringSchema("rename 的目标路径"),
+			"path":           path,
+			"operation":      enumSchema("文件操作；用户提出删除、移除或清理时请使用 move_out(action=prepare)，确认后再 move_out(action=submit)", "create", "update", "rename"),
+			"base_sha256":    stringSchema("update/rename 必填读取时获得的文件 sha256；create 通过目标不存在保护"),
+			"content":        stringSchema("新文件的完整内容"),
+			"content_base64": stringSchema("完整目标字节的标准 Base64；仅 create/update，须 newline_policy=exact，与 content/replacements/range 互斥"),
+			"newline_policy": enumSchema("preserve 使用现有逻辑文本编辑；exact 原样写入 content_base64 字节，不转换编码/BOM/换行", "preserve", "exact"),
+			"expected_format": map[string]any{
+				"type": "object", "additionalProperties": false,
+				"description": "约束最终写入字节；不执行格式转换，不匹配则写入前拒绝",
+				"properties": map[string]any{
+					"charset":     enumSchema("预期编码", "utf-8", "utf-16le", "utf-16be"),
+					"bom":         enumSchema("预期 BOM", "none", "utf-8", "utf-16le", "utf-16be"),
+					"line_ending": enumSchema("预期换行", "none", "LF", "CRLF", "CR", "mixed"),
+				}, "required": []string{"charset", "bom", "line_ending"},
+			},
+			"new_path": stringSchema("rename 的目标路径"),
 			"replacements": arraySchema(map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
@@ -201,6 +225,10 @@ func (r *Runtime) registerCleanCoreTools(s *mcp.Server) {
 			},
 		},
 		"required": []string{"path", "operation"},
+		"allOf": []map[string]any{{
+			"if":   map[string]any{"properties": map[string]any{"operation": map[string]any{"enum": []string{"update", "rename"}}}},
+			"then": map[string]any{"required": []string{"base_sha256"}},
+		}},
 	}
 	r.addTool(s, cleanCoreTool("edit", desc["edit"], map[string]any{
 		"remote_session_id": remoteSession,
