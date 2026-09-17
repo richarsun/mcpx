@@ -27,7 +27,7 @@ MCPX 现有 `user_confirmed=true` 只绑定单个 exact command digest。真人�
 Stage V1 只对能够证明 classification/execution equivalence 的普通 Git 动作复用 grant。以下形态不禁止用户使用 Git，而是 **grant-ineligible / fallback to existing confirmation**：
 
 - 所有 SSH / scp-like Git remote，包括 canonical `git@github.com:owner/repo` 与 `ssh://...`；
-- URL-specific、reset、multiple、shell、absolute/custom 或来源不可证明的 credential helper；
+- 超出下文 Windows GitHub CLI 固定凭据链窄例外的 URL-specific、reset、multiple、shell、absolute/custom 或来源不可证明的 credential helper；
 - 会注入/改变 Git config 来源的未建模 `GIT_CONFIG_*` 环境；
 - 裸 symbolic revision、range 或其他不能唯一证明解释的 revision grammar；
 - `go test` / `go vet` / `go build` 等代码执行型验证命令及现有高风险/未知动作。
@@ -43,7 +43,7 @@ Revision 正向只包含默认 HEAD、显式 `refs/heads/<name>` 和已验证 fu
 - 不让 production、credential、payment、永久删除、force push、系统网络/服务控制等高风险动作自动继承普通 grant。
 - 首版不让 `go test`、`go vet`、`go build` 等可能执行仓库代码的验证命令自动复用 grant；它们继续走现有逐命令确认。
 - 本 change 不包含部署、发布、Tunnel、账号权限或设备配置修改。
-- Stage V1 不承诺 SSH grant reuse、URL-specific/multiple/shell/custom credential helper grant、复杂 revision grammar、双账号、全平台或全部中断场景。
+- Stage V1 不承诺 SSH grant reuse、超出 Windows GitHub CLI 固定凭据链窄例外的 URL-specific/multiple/shell/custom credential helper grant、复杂 revision grammar、双账号、全平台或全部中断场景。
 
 ## Acceptance
 
@@ -60,3 +60,12 @@ Revision 正向只包含默认 HEAD、显式 `refs/heads/<name>` 和已验证 fu
 - 命令分类错误可能导致授权过宽，因此分类器采用严格 allowlist 和 fail-closed；未知参数、外部执行面或无法证明的路径回退逐命令确认。
 - grant 是协议状态，持久化、幂等和审计必须原子一致；恢复测试和唯一 active-scope 约束用于阻止重复或分叉状态。
 - 该候选涉及授权安全边界，合并前需要独立只读 Review；作者自测不能替代该质量门。
+
+
+## 2026-09-17 获准增量：当前 Windows GitHub CLI helper
+
+真人已批准原实施停止后由当前 Codex 接手四步：支持现有 helper、正常 HOME 验证、独立复审、本机部署与真实闭环。此增量只新增下面的窄例外，替代前文“所有 URL-specific helper 均回确认 / system manager 是唯一正例”的绝对表述；其他未知 helper、SSH、注入和高风险边界不变。
+
+只接受 Windows 的 canonical GitHub HTTPS remote。有效 generic helper 仍限无 helper 或原可信 system manager。URL-specific helper 仅接受 global 用户 .gitconfig 中精确的 `credential.https://github.com.helper`，依次为空 reset 和单个 `!'受信任安装绝对路径/gh.exe' auth git-credential`；可共存同形的 gist.github.com 配置。可信 gh 必须通过既有安装位置、符号链接解析、regular file 和 PE 格式校验；只接受固定命令，不执行 helper 做探测。额外参数、shell 片段、更多 helper、路径/主机变体、repo/worktree/include 来源及 GIT_CONFIG_* 注入全部回确认。每个动作重新核对有效配置与可执行身份，不修改用户配置，不复制或输出凭据。
+
+正常 HOME 的 fetch/push 分类正例与隔离负例分别留证；模拟通过不能代签真实网络、grant 复用、撤销和幂等验收。源码复审必须绑定新 exact candidate。部署仅限 controller-win-01，独立审核和完整制品/回滚准备之前不替换运行物；不 merge main/Tag/Release，不处理其他遗留问题。

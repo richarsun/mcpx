@@ -1664,12 +1664,8 @@ func resolveGitRemote(ctx context.Context, workspaceRoot, repoAbs, remote string
 }
 
 func networkCredentialHelperGrantSafety(ctx context.Context, repoAbs string) error {
-	urlScoped, err := boundedGitOptional(ctx, repoAbs, "config", "--get-regexp", `^credential\..+\.helper$`)
-	if err != nil {
+	if err := githubCLIURLHelpersGrantSafety(ctx, repoAbs); err != nil {
 		return err
-	}
-	if strings.TrimSpace(urlScoped) != "" {
-		return errors.New("URL-scoped credential helper configuration is not grant eligible")
 	}
 
 	configured, err := boundedGitOptional(ctx, repoAbs, "config", "--show-origin", "--get-all", "credential.helper")

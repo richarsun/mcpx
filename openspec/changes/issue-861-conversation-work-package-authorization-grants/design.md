@@ -73,9 +73,9 @@ Windows drive-absolute 例外只在 `runtime.GOOS == "windows"` 时成立。POSI
 
 #### B. Narrow credential-helper model
 
-Stage V1 不实现完整 Git credential matching engine。对 GitHub HTTPS remote，grant reuse 只允许：无 credential helper；或 Windows 下唯一、来源可证明为同一受信任 Git for Windows system config 的 `credential.helper=manager`，且对应 helper binary 可验证属于同一安装树。
+Stage V1 不实现完整 Git credential matching engine。对 GitHub HTTPS remote，generic helper 只允许无 helper 或 Windows 下唯一、来源可证明为同一受信任 Git for Windows system config 的 `credential.helper=manager`，且对应 helper binary 可验证属于同一安装树。URL-specific helper 仅允许下文 2026-09-17 增量定义的 Windows GitHub CLI 固定凭据链。
 
-发现任一以下形态即 grant-ineligible 并回到 ordinary confirmation：`credential.<url>.helper`、empty reset、multiple helpers、`!shell` helper、absolute/custom helper、来源不可证明 helper，或会改变 Git config 来源/注入的未冻结 `GIT_CONFIG_*` 环境。分类阶段不得先运行这些 helper 来判断是否安全。
+除下文 Windows GitHub CLI 固定凭据链外，发现任一以下形态即 grant-ineligible 并回到 ordinary confirmation：`credential.<url>.helper`、empty reset、multiple helpers、`!shell` helper、absolute/custom helper、来源不可证明 helper，或会改变 Git config 来源/注入的未冻结 `GIT_CONFIG_*` 环境。分类阶段不得先运行这些 helper 来判断是否安全。
 
 #### C. SSH transport boundary
 
@@ -113,3 +113,12 @@ SQLite migration 创建 grant 表与唯一 active-scope/index 约束。Create/re
 ## 8. Independent Strong Protocols
 
 `move_out` schema 不增加 authorization 字段，submit 仍必须使用 prepare 返回的服务端 confirmation UUID。普通 grant 永远不能替代或消费该强确认协议。
+
+
+## 2026-09-17 获准增量：当前 Windows GitHub CLI helper
+
+真人已批准原实施停止后由当前 Codex 接手四步：支持现有 helper、正常 HOME 验证、独立复审、本机部署与真实闭环。此增量只新增下面的窄例外，替代前文“所有 URL-specific helper 均回确认 / system manager 是唯一正例”的绝对表述；其他未知 helper、SSH、注入和高风险边界不变。
+
+只接受 Windows 的 canonical GitHub HTTPS remote。有效 generic helper 仍限无 helper 或原可信 system manager。URL-specific helper 仅接受 global 用户 .gitconfig 中精确的 `credential.https://github.com.helper`，依次为空 reset 和单个 `!'受信任安装绝对路径/gh.exe' auth git-credential`；可共存同形的 gist.github.com 配置。可信 gh 必须通过既有安装位置、符号链接解析、regular file 和 PE 格式校验；只接受固定命令，不执行 helper 做探测。额外参数、shell 片段、更多 helper、路径/主机变体、repo/worktree/include 来源及 GIT_CONFIG_* 注入全部回确认。每个动作重新核对有效配置与可执行身份，不修改用户配置，不复制或输出凭据。
+
+正常 HOME 的 fetch/push 分类正例与隔离负例分别留证；模拟通过不能代签真实网络、grant 复用、撤销和幂等验收。源码复审必须绑定新 exact candidate。部署仅限 controller-win-01，独立审核和完整制品/回滚准备之前不替换运行物；不 merge main/Tag/Release，不处理其他遗留问题。

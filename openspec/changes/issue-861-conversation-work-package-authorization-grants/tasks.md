@@ -41,6 +41,16 @@
 - [x] P1-3：Stage V1 canonical scp 与 `ssh://` remote 均 grant-ineligible / fallback ordinary confirmation；恶意 ssh_config/marker 未经 grant classification 执行。
 - [x] P1-4：git_read target 已收窄为 default HEAD、显式 `refs/heads/...` 与 verified full OID；bare symbolic revision fallback，full OID 在同名 40-hex ref 前按 object identity 校验，actual argv 使用 canonical ref/OID；branch/tag/OID ambiguity 与 narrow alias 回归通过。
 - [x] 第三轮验证完成：Windows P1 focused PASS 30.054s、target ambiguity PASS 12.720s、最新 exact worktree `internal/authorization` PASS 114.205s、`TestConversationAuthorization*` PASS 51.934s、HTTPS 正向 PASS 4.510s；Linux authorization 当前树 PASS 10.130s；affected race PASS（authorization 10.618s、server 351.021s）；diff-check、普通 build、vet、CGO=0 build exit 0；OpenSpec strict PASS。Linux `go test ./... -count=1` 唯一 FAIL 为 `TestReviewCancelStopsGrandchildEffects/parent-exits`，current candidate 重复 5/5 FAIL，deployed PR #4 exact `3ab6574` 重复 3/3 同样 FAIL，确认是既有 PR #4 baseline，未声明 full-test PASS。
-- [ ] 冻结最终 integrated exact commit/tree，确认 worktree/staged clean 与 `83921e3..new-head` delta 后正常 fast-forward push PR #3 branch，并回写 Draft PR/#861/#823；必要时再同步中央 #824 OpenSpec。
-- [ ] 由同一独立 Reviewer 对最终 exact candidate、`83921e3..new-head`、4 P1 原失败机制、四条安全不变量和 M1 integration 给出新 PASS/NEEDS_FIX；PASS 前保持 Draft/review-required。
+- [x] 前轮已冻结并推送 integrated candidate `cc9a4c4057301d2596a2cc90675ba00c8f684e41` / tree `dcaaa932a495e78274d7fe4d158f9b32de0ee78a`，PR #3 保持 Draft；中央 #824 为 `68f9242`。
+- [x] 同一独立 Reviewer 已完成 cc9a4c4 复审：四个 P1、M1 preservation、安全结论与 Linux baseline attribution PASS；正常 HOME HTTPS 一次授权适用性 NOT MET，deployment-candidate HOLD。该结论不覆盖下面的新增量。
 - [x] 不部署、不发布；只有后续新的明确授权才进入发行阶段。
+
+
+## 获准的 Windows GitHub CLI 窄例外续接
+
+- [x] 回读 cc9a4c4、安全 PASS / 实机适用 HOLD 与原实施 idle；写域由当前 Codex 接手。
+- [x] 正常 HOME 复现 RED 并实现固定 global GitHub CLI helper 链支持，不修改凭据或真实用户配置。
+- [x] Windows authorization 整包 PASS 154.410s（含正常 HOME 分类）；Runtime conversation/recovery 定向 PASS 54.948s；新 helper race PASS 24.008s；受影响包 vet、gofmt 与 OpenSpec strict PASS。
+- [x] 正常 HOME Runtime 实际 GitHub HTTPS 验收 PASS 18.937s：同一 grant 的 fetch / push exit 0；push 为原 PR 分支相同提交回推，远端 OID 不变；revoke 后新 push 回确认，已完成 push 重放原 Task 且 attach exit 0。长任务的幂等原回执可能仍为 accepted，终态须从原 Task 回读。验收默认跳过，显式 `MCPX_TEST_REAL_GH_NETWORK=1` 才联网。
+- [ ] 冻结新候选，原独立 Reviewer 审核增量并解除适用 HOLD。
+- [ ] 精确制品/回滚准备、本机部署、真实 fetch/push/Draft PR/grant 撤销及结果重放验收。

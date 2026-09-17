@@ -75,8 +75,8 @@ Runtime SHALL 只对能够证明分类语义与实际执行语义一致的 Git �
 #### Scenario: HTTPS credential helper 必须绑定受信任 Git 安装
 
 - **WHEN** grant-eligible GitHub HTTPS remote 的有效 Git 配置启用了 credential helper
-- **THEN** Runtime SHALL 只在 helper 配置来源与 helper binary 都能绑定到已验证的同一 Git 安装时允许 grant reuse
-- **AND** repository/global/system 中出现的未知、shell、多个或来源不可证明的 helper SHALL fail-closed
+- **THEN** Runtime SHALL 只允许绑定同一受信任 Git 安装的 system manager，或本 spec 定义的 Windows GitHub CLI 固定凭据链窄例外
+- **AND** 超出这两种模型的未知、shell、多个或来源不可证明的 helper SHALL fail-closed
 
 #### Scenario: 所有 grant-eligible git_read 都必须有规范 target
 
@@ -105,7 +105,7 @@ Runtime SHALL 只对能够证明分类语义与实际执行语义一致的 Git �
 
 #### Scenario: URL-scoped credential helper 超出窄模型时禁用 grant reuse
 
-- **WHEN** 有效 Git 配置包含 `credential.<url>.helper`
+- **WHEN** 有效 Git 配置包含 `credential.<url>.helper` 且不满足 Windows GitHub CLI 固定凭据链窄例外
 - **THEN** Stage V1 SHALL 将该 network Git 动作标为 grant-ineligible
 - **AND** 用户仍可通过 existing ordinary confirmation 执行该 Git 形态
 
@@ -113,7 +113,7 @@ Runtime SHALL 只对能够证明分类语义与实际执行语义一致的 Git �
 
 - **WHEN** 任一有效配置层对匹配 URL 提供空 helper reset
 - **THEN** Runtime SHALL NOT 把仅查询到的 system/default helper 当成完整 helper chain
-- **AND** grant reuse SHALL fail-closed
+- **AND** 除 Windows GitHub CLI 固定凭据链窄例外外，grant reuse SHALL fail-closed
 
 #### Scenario: Multiple credential helpers 必须 fail-closed
 
@@ -123,17 +123,17 @@ Runtime SHALL 只对能够证明分类语义与实际执行语义一致的 Git �
 
 #### Scenario: Shell credential helper 必须 fail-closed
 
-- **WHEN** 有效 helper 使用 `!shell-command`
+- **WHEN** 有效 helper 使用不属于 Windows GitHub CLI 固定凭据链窄例外的 `!shell-command`
 - **THEN** grant 分类 SHALL 在 helper side effect 前 fail-closed
 - **AND** marker command SHALL NOT 因 grant 分类或 grant-backed 执行被启动
 
 #### Scenario: Absolute 或 custom credential helper 必须 fail-closed
 
-- **WHEN** helper 指向 absolute/custom executable 或其来源无法绑定到受信任 Git 安装
+- **WHEN** helper 指向 absolute/custom executable 或来源不可信，且不属于 Windows GitHub CLI 固定凭据链窄例外
 - **THEN** Stage V1 SHALL 将动作标为 grant-ineligible
 - **AND** SHALL NOT 通过运行 helper 来判断其可信性
 
-#### Scenario: Windows trusted system manager 是唯一 helper 正向例外
+#### Scenario: Windows trusted system manager 正向路径
 
 - **WHEN** Windows GitHub HTTPS remote 只配置一个 `credential.helper=manager`，其配置可证明来自同一受信任 Git for Windows system config，且 helper binary 位于同一已验证安装树
 - **THEN** credential helper 检查 MAY 允许继续 grant classification
@@ -141,7 +141,7 @@ Runtime SHALL 只对能够证明分类语义与实际执行语义一致的 Git �
 
 #### Scenario: System manager 加 URL override 必须 fail-closed
 
-- **WHEN** system config 提供受信任 manager，但 repository/global/其他有效层同时提供 URL-specific reset 或 override
+- **WHEN** system config 提供受信任 manager，但 repository/global/其他有效层同时提供不符合 Windows GitHub CLI 固定凭据链窄例外的 URL-specific reset 或 override
 - **THEN** Runtime SHALL 将动作标为 grant-ineligible
 - **AND** SHALL NOT 只依据 system manager 判定 helper 执行面可信
 
@@ -288,3 +288,21 @@ Conversation grant SHALL NOT 扩展或替代 `move_out` 的 prepare → confirm 
 - **WHEN** 调用方未提供 context、grant ID 或 authorization request
 - **THEN** Runtime SHALL 使用原有 Allow/Confirm/Deny 流程
 - **AND** 不得隐式创建、查找或继承 conversation grant
+
+
+### Requirement: Windows GitHub CLI 固定凭据链窄例外
+
+Runtime SHALL 只接受下述固定凭据链作为 URL-specific/reset/shell-helper 拒绝规则的窄例外；其他拒绝场景保持有效。
+
+#### Scenario: 当前正常 HOME 的官方 GitHub CLI 配置
+
+- **WHEN** Windows canonical GitHub HTTPS 使用用户 global .gitconfig 的精确 host helper，值依次为空 reset 与固定的受信任安装绝对路径 gh.exe auth git-credential，generic helper 也符合既有约束
+- **THEN** Runtime MAY 将该动作继续按 repository/target/scope 等边界分类为 grant eligible
+- **AND** 同形 gist.github.com helper MAY 共存；normal HOME 的 fetch/push 必须分别验收
+- **AND** Runtime SHALL 校验 gh 的原生可执行格式、解析后安装路径及固定参数，不执行 helper 探测、不读取或回显凭据、不修改 global config
+
+#### Scenario: 窄例外不能扩展为任意 shell 或 URL helper
+
+- **WHEN** helper 来源不是用户 global .gitconfig，URL 不是精确 github.com/gist.github.com，reset/值数/顺序不符，程序不可信，或附加命令/参数/更多 helper
+- **THEN** Runtime SHALL 在执行 helper 前回退原确认，不匹配 grant
+- **AND** 下一动作发现配置变化 SHALL 重新判定；撤销/narrow/幂等与 deny 优先保持原合同
