@@ -70,10 +70,15 @@ func installMoveOutTrashMocks(t *testing.T, platform string) string {
 		t.Fatalf("unsupported test platform %q", platform)
 	}
 	writeMoveOutTestCommand(t, binDir, "uname", "printf '%s\\n' '"+uname+"'")
-	writeMoveOutTestCommand(t, binDir, command, `last=''
+	moveScript := `last=''
 for arg in "$@"; do last=$arg; done
 name=${last##*/}
-mv "$last" "$MCPX_TEST_TRASH/$name"`)
+mv "$last" "$MCPX_TEST_TRASH/$name"`
+	if platform == "windows" {
+		moveScript = `name=${MCPX_RECYCLE_TARGET##*/}
+mv "$MCPX_RECYCLE_TARGET" "$MCPX_TEST_TRASH/$name"`
+	}
+	writeMoveOutTestCommand(t, binDir, command, moveScript)
 	t.Setenv("MCPX_TEST_TRASH", trashDir)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return trashDir
