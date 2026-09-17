@@ -32,6 +32,15 @@
 - [x] 结构性修复第二轮 3 个 P1：在本地路径归一化前拒绝 helper/scp 歧义 remote；分类探测与 grant-backed 实际进程共享冻结 environment，在任何 Git 探测前拒绝非空 `GIT_EXEC_PATH`；`git branch --show-current` 绑定当前 branch，plain `git branch` grant-ineligible。另将 grant-backed Git PATH 收敛到受信任 Git/系统目录，并只允许可绑定到同一受信任 Git for Windows 安装的 system `credential.helper=manager`。
 - [x] 增加 fetch/push remote-helper side-effect marker、Runtime `GIT_EXEC_PATH` child marker、hostile PATH 清洗、非受信 credential helper、branch narrow/detached/plain-read 以及 Git action repository/target/environment invariant 回归。
 - [x] 重新运行定向/包级/Runtime/整仓与静态门禁：Windows `internal/authorization` PASS 102.864s；Windows `TestConversationAuthorization*` PASS 66.211s；Linux authorization PASS 4.983s；Linux `go test ./... -count=1` PASS（authorization 18.578s、server 172.194s）；affected race PASS（authorization 6.732s、server 267.279s）；gofmt、diff-check、普通 build、vet、CGO=0 build 均 exit 0；OpenSpec strict 2 passed / 0 failed。历史 unrelated full-repo race 问题未声明为 PASS。
-- [ ] 以 `42e952e` 为唯一 parent 创建普通 follow-up commit，冻结 new exact commit/tree，正常 fast-forward push 原 branch；保持 Draft PR `richarsun/mcpx#3` 与 #861 open，不 amend/force-push/merge/release/deploy/tag。
-- [ ] 由同一独立只读 Reviewer 仅复核 `42e952e..new-head` 收敛 delta、四条安全不变量和新冻结候选；未取得 PASS 前保持 review-required。
+- [x] 以 `42e952e` 为唯一 parent 创建普通 follow-up `83921e3138bc2a05f9e956c038104e38980f3aeb` / tree `2f376d0107dd8798a12bfb40a29fd6d9044dcc91`，正常 fast-forward push 原 branch；保持 Draft PR `richarsun/mcpx#3` 与 #861 open，未 amend/force-push/merge/release/deploy/tag。
+- [x] 同一独立 Reviewer 对 `83921e3` 第三轮复审返回 NEEDS_FIX：POSIX `C:/repo` 盘符解释、URL-specific credential helper、SSH config execution surface、branch/tag/object revision ambiguity 共 4 个 P1；旧 PASS/NEEDS_FIX 历史不改写。
+- [x] M1 将包含 PR #2 的当前 deployed confirmation-recovery head `3ab65746753924ce5b31c6a9996c94c1365bba6b` 机械整合进 PR #3 lineage，形成本地 merge commit `f190d591c1970acaa0c80c969d055c366a073bda`；保留双方历史，未 push、未合 main、未部署。
+- [x] 正式记录 Stage V1 收窄合同：Windows 单账号/单 Session/Workspace/repository + GitHub HTTPS；SSH、超出窄模型的 credential helper 与歧义 revision 均 grant-ineligible / fallback to existing confirmation。
+- [ ] P1-1：Windows drive-path 例外平台化；POSIX `C:/repo` 在 SSH/helper side effect 前 fail-closed，并补 Linux fetch/push marker 与 Windows local-path 回归。
+- [ ] P1-2：实现窄 credential-helper 模型；覆盖 URL-specific/reset/multiple/shell/absolute/unknown source 与 `GIT_CONFIG_*` 注入，并保留 trusted Windows system manager 正例。
+- [ ] P1-3：Stage V1 所有 SSH/scp remote 不复用 grant；覆盖 canonical scp、`ssh://` 与恶意 ssh_config marker。
+- [ ] P1-4：revision 只 grant 默认 HEAD、显式 `refs/heads/...`、verified full OID；bare ambiguous revision fallback，并让 actual argv 使用 canonical ref/OID。
+- [ ] 运行第三轮 4 P1 行为回归、Windows authorization/Runtime、Linux authorization/full test、affected race、static/build/vet/CGO=0 与 OpenSpec strict；无关历史失败单独保留。
+- [ ] 冻结最终 integrated exact commit/tree，确认 worktree/staged clean 与 `83921e3..new-head` delta 后正常 fast-forward push PR #3 branch，并回写 Draft PR/#861/#823；必要时再同步中央 #824 OpenSpec。
+- [ ] 由同一独立 Reviewer 对最终 exact candidate、`83921e3..new-head`、4 P1 原失败机制、四条安全不变量和 M1 integration 给出新 PASS/NEEDS_FIX；PASS 前保持 Draft/review-required。
 - [x] 不部署、不发布；只有后续新的明确授权才进入发行阶段。

@@ -58,12 +58,32 @@ Repository identity 逐项精确匹配；purpose/target 使用受限 glob；writ
 
 第二轮独立 Review 证明，仅对已知 argv 形态逐点封堵不足以证明授权复用安全。首版 Git grant reuse 必须同时满足以下四条不变量；任一条无法证明时动作必须 grant-ineligible，并回到原逐命令策略：
 
-1. **Remote identity invariant**：分类器规范化出的 repository identity 必须与 Git 实际执行时对 remote 字符串的 transport 解释唯一且一致。`<transport>::<address>`、除明确允许的 canonical `git@github.com:owner/repo` 外的 scp-like `host:path` / `user@host:path` 等歧义连接形式不得先按 Workspace 本地路径归一化；合法 Windows 绝对盘符路径单独识别。
-2. **Execution-surface invariant**：grant 绑定的不只是顶层 executable 与 argv，还包括会改变 Git 子程序解析的关键执行环境。非空 `GIT_EXEC_PATH` 等可替换 Git child program 的环境不得参与 grant reuse；分类探测与真正 grant-backed 执行必须使用同一冻结环境语义。Grant-backed Git 的 PATH 必须由已验证 Git 安装派生，不继承任意宿主 PATH shadow；HTTPS credential helper 只能在来源与 helper binary 都能绑定到同一受信任 Git 安装时进入 grant reuse，否则 fail-closed。
-3. **Target-completeness invariant**：所有 grant-eligible `git_read` 必须具有非空、规范化且可匹配的 `Action.Targets`。无法确定 branch/object target 时必须 fail-closed；`git branch --show-current` 绑定当前 attached branch，plain `git branch` 首版不进入 grant allowlist。
-4. **Classification/execution equivalence**：分类阶段批准的 executable、argv、repository/target 解释和受控环境必须原样约束实际进程；不得出现分类器看到本地 repository 或可信 Git，而执行阶段因 transport/helper/environment 漂移到另一执行面。
+1. **Remote identity invariant**：分类器规范化出的 repository identity 必须与 Git 实际执行时对 remote 字符串的 transport 解释唯一且一致。`<transport>::<address>` 与 SSH/scp-like `host:path` / `user@host:path` 不得先按 Workspace 本地路径归一化；Stage V1 所有 SSH/scp remote 一律 grant-ineligible。Windows 绝对盘符路径例外只在 Windows 生效；POSIX 上 `C:/repo` 等 colon form 不得套用 Windows local-path 规则。
+2. **Execution-surface invariant**：grant 绑定的不只是顶层 executable 与 argv，还包括会改变 Git 子程序、transport 与 config/helper 解析的关键执行环境。非空 `GIT_EXEC_PATH` 以及未建模的 `GIT_CONFIG_*` 等 config source/injection 环境不得参与 grant reuse；分类探测与真正 grant-backed 执行必须使用同一冻结环境语义。Grant-backed Git 的 PATH 必须由已验证 Git 安装派生，不继承任意宿主 PATH shadow。
+3. **Target-completeness invariant**：所有 grant-eligible `git_read` 必须具有非空、规范化且可匹配的 `Action.Targets`，并且 target 的分类解释必须唯一。Stage V1 只支持默认 HEAD、显式 `refs/heads/<name>` 与已验证 full object ID；裸 symbolic revision、range、detached/未知 target 或 plain `git branch` grant-ineligible。
+4. **Classification/execution equivalence**：分类阶段批准的 executable、argv、environment、repository 与 target 语义必须约束实际进程。经验证的 revision 必须以 canonical ref/OID 写回实际执行 argv，不得一边分类为 `refs/heads/main` 一边执行裸 `main`；不得因 transport/helper/config/environment 在执行阶段扩张。
 
-实现与测试必须对全部 grant-eligible Git action 做 surface audit：需要 repository scope 的动作不得产生空 repository；需要 target scope 的 `git_read` 不得产生空 target；remote/helper 与 child-program 语义不得依赖分类阶段未冻结的环境。
+实现与测试必须对全部 grant-eligible Git action 做 surface audit：需要 repository scope 的动作不得产生空 repository；需要 target scope 的 `git_read` 不得产生空 target；remote/helper/config 与 child-program 语义不得依赖分类阶段未冻结的环境。
+
+### 4.2 Stage V1 第三轮收窄
+
+#### A. Platform-specific remote interpretation
+
+Windows drive-absolute 例外只在 `runtime.GOOS == "windows"` 时成立。POSIX 上 `C:/repo` 可能被 Git 解释为 SSH `host:path`，所以必须在 local normalization、SSH/helper 探测或任何副作用之前 fail-closed。Windows 合法 drive absolute local repository 仍可按既有 Workspace/path 边界进入正向分类。
+
+#### B. Narrow credential-helper model
+
+Stage V1 不实现完整 Git credential matching engine。对 GitHub HTTPS remote，grant reuse 只允许：无 credential helper；或 Windows 下唯一、来源可证明为同一受信任 Git for Windows system config 的 `credential.helper=manager`，且对应 helper binary 可验证属于同一安装树。
+
+发现任一以下形态即 grant-ineligible 并回到 ordinary confirmation：`credential.<url>.helper`、empty reset、multiple helpers、`!shell` helper、absolute/custom helper、来源不可证明 helper，或会改变 Git config 来源/注入的未冻结 `GIT_CONFIG_*` 环境。分类阶段不得先运行这些 helper 来判断是否安全。
+
+#### C. SSH transport boundary
+
+Stage V1 唯一 remote grant 正向路径是 GitHub HTTPS。所有 `git@github.com:...`、其他 scp-like remote 与 `ssh://...` 均 grant-ineligible；SSH 本身不被禁止，继续走现有逐命令确认。Runtime 不尝试解析或隔离 user/system `ssh_config`、`HostName`、`ProxyCommand`、`Match exec` 或 `Include`，grant 分类与 grant-backed 执行都不得触发其中副作用。
+
+#### D. Canonical revision execution
+
+Stage V1 revision 正向只支持默认 HEAD、显式 `refs/heads/<name>` 与经 Git 验证存在的 full object ID。裸 symbolic revision（如 `main`）、`HEAD~1`、range 等无法证明唯一解释的输入 grant-ineligible。Full OID 必须先按 object identity 验证，不能因为存在同名 branch/ref 而误分类；branch/tag 同名时裸名不得进入 grant。Grant narrow 后不得通过 bare/tag/OID alias 恢复已移出 scope 的 target。
 
 ## 5. Lifecycle
 

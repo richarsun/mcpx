@@ -91,6 +91,108 @@ Runtime SHALL 只对能够证明分类语义与实际执行语义一致的 Git �
 - **THEN** 实际执行 SHALL 使用分类时冻结的可信 executable、argv 和受控 environment
 - **AND** repository/target/remote/helper 的实际解释 SHALL 不得比分类得到的执行面更宽
 
+#### Scenario: POSIX C drive lookalike remote 在任何 SSH 副作用前 fail-closed
+
+- **WHEN** POSIX 上 fetch/push remote 为 `C:/repo`，Workspace 中同时存在形似本地 bare repo 的 lookalike 路径
+- **THEN** Runtime SHALL NOT 套用 Windows drive-absolute local-path 例外
+- **AND** 动作 SHALL 在 SSH、remote helper 或 marker side effect 启动前 grant-ineligible
+
+#### Scenario: Windows 绝对盘符本地路径保持正向
+
+- **WHEN** Windows 上 remote/repository 是合法且位于授权 Workspace 边界内的 drive-absolute local path
+- **THEN** Runtime MAY 按 Windows 本地路径语义分类
+- **AND** 既有 Workspace scope/path escape 检查 SHALL 继续生效
+
+#### Scenario: URL-scoped credential helper 超出窄模型时禁用 grant reuse
+
+- **WHEN** 有效 Git 配置包含 `credential.<url>.helper`
+- **THEN** Stage V1 SHALL 将该 network Git 动作标为 grant-ineligible
+- **AND** 用户仍可通过 existing ordinary confirmation 执行该 Git 形态
+
+#### Scenario: Empty credential helper reset 必须被检测
+
+- **WHEN** 任一有效配置层对匹配 URL 提供空 helper reset
+- **THEN** Runtime SHALL NOT 把仅查询到的 system/default helper 当成完整 helper chain
+- **AND** grant reuse SHALL fail-closed
+
+#### Scenario: Multiple credential helpers 必须 fail-closed
+
+- **WHEN** Git 的有效 helper chain 含多个 helper
+- **THEN** Stage V1 SHALL NOT 尝试证明其组合执行面安全
+- **AND** 动作 SHALL 回到 ordinary confirmation
+
+#### Scenario: Shell credential helper 必须 fail-closed
+
+- **WHEN** 有效 helper 使用 `!shell-command`
+- **THEN** grant 分类 SHALL 在 helper side effect 前 fail-closed
+- **AND** marker command SHALL NOT 因 grant 分类或 grant-backed 执行被启动
+
+#### Scenario: Absolute 或 custom credential helper 必须 fail-closed
+
+- **WHEN** helper 指向 absolute/custom executable 或其来源无法绑定到受信任 Git 安装
+- **THEN** Stage V1 SHALL 将动作标为 grant-ineligible
+- **AND** SHALL NOT 通过运行 helper 来判断其可信性
+
+#### Scenario: Windows trusted system manager 是唯一 helper 正向例外
+
+- **WHEN** Windows GitHub HTTPS remote 只配置一个 `credential.helper=manager`，其配置可证明来自同一受信任 Git for Windows system config，且 helper binary 位于同一已验证安装树
+- **THEN** credential helper 检查 MAY 允许继续 grant classification
+- **AND** 其他 repository/target/environment 不变量仍须独立满足
+
+#### Scenario: System manager 加 URL override 必须 fail-closed
+
+- **WHEN** system config 提供受信任 manager，但 repository/global/其他有效层同时提供 URL-specific reset 或 override
+- **THEN** Runtime SHALL 将动作标为 grant-ineligible
+- **AND** SHALL NOT 只依据 system manager 判定 helper 执行面可信
+
+#### Scenario: Git config 环境注入必须 fail-closed
+
+- **WHEN** 当前环境存在会改变 config source 或注入 config 的未冻结 `GIT_CONFIG_*` 变量
+- **THEN** Stage V1 SHALL 在 Git config/helper 探测副作用前拒绝 grant reuse
+- **AND** ordinary confirmation 路径 SHALL 保持可用
+
+#### Scenario: Canonical SSH remote 回退 ordinary confirmation
+
+- **WHEN** remote 为 `git@github.com:owner/repo`、其他 scp-like form 或 `ssh://...`
+- **THEN** Stage V1 SHALL 将其标为 grant-ineligible
+- **AND** SHALL NOT 把 SSH Git 整体判为 Deny
+
+#### Scenario: SSH config 不得经 grant path 执行
+
+- **WHEN** user/system SSH config 含 `HostName`、`ProxyCommand`、`Match exec`、`Include` 或恶意 marker
+- **THEN** grant classification 与 grant-backed execution SHALL NOT 启动 SSH 或触发该 marker
+- **AND** Runtime SHALL 不以解析完整 SSH config 作为 Stage V1 前提
+
+#### Scenario: Branch 与 tag 同名的裸 revision 必须 fail-closed
+
+- **WHEN** `refs/heads/main` 与 `refs/tags/main` 同时存在且指向不同对象，而命令输入裸 `main`
+- **THEN** Runtime SHALL NOT 猜测 branch/tag precedence 并复用 grant
+- **AND** 该 revision SHALL 回到 ordinary confirmation
+
+#### Scenario: 显式 refs/heads branch 是正向 canonical target
+
+- **WHEN** Git read 使用显式 `refs/heads/<branch>` 且该 ref 经验证存在并位于 grant scope
+- **THEN** `Action.Targets` SHALL 绑定该 canonical branch target
+- **AND** actual argv SHALL 使用该已验证 canonical ref
+
+#### Scenario: Full object ID 按 object identity 解析
+
+- **WHEN** 输入是经验证存在的 full object ID，即使仓库同时存在与该 40-hex 字符串同名的 ref
+- **THEN** Runtime SHALL 将 target 绑定为 object identity
+- **AND** actual argv SHALL 使用已验证 full OID，而不是先误分类成同名 branch/ref
+
+#### Scenario: Narrow 后 alias 不得恢复已移除 target
+
+- **WHEN** grant 已 narrow 移除某 target
+- **THEN** bare/tag/OID alias SHALL NOT 让后续 read 重新访问该已移除 target
+- **AND** target matcher SHALL 基于 canonical validated identity 做边界判断
+
+#### Scenario: Unsupported revision 回到 ordinary confirmation
+
+- **WHEN** revision 是裸 symbolic name、`HEAD~1`、range 或其他 Stage V1 未唯一建模语法
+- **THEN** Runtime SHALL 将动作标为 grant-ineligible
+- **AND** SHALL NOT 静默扩大 grant classifier 或把该 Git 能力改成不可用
+
 ### Requirement: 边界实质变化必须重新受限
 
 Grant SHALL 只在当前 principal、authorization context、Remote Session、Workspace、work package、purpose、repository、target、write path 和风险均在 scope 内时匹配。任一实质变化 SHALL 导致不匹配。
