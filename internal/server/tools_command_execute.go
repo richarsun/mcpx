@@ -20,6 +20,7 @@ import (
 	"mcpx/internal/envelope"
 	"mcpx/internal/environment"
 	workspacefile "mcpx/internal/file"
+	"mcpx/internal/mcpresult"
 	"mcpx/internal/projecttask"
 	"mcpx/internal/remotesession"
 	"mcpx/internal/security"
@@ -164,27 +165,14 @@ func (r *Runtime) toolCommandExecute(ctx context.Context, req *mcp.CallToolReque
 					confirmationData["summary"] = "临时脚本等待用户确认；服务端不保存脚本正文，也不提供可直接执行的重试模板。调用方须回读已保存的完整原始请求与脚本，核对 script_sha256、script_bytes、Workspace 身份并保留全部业务参数、remote_session_id 和 idempotency_key；获准后仅将 user_confirmed 改为 true。原始请求缺失或校验失败时停止，不得重建等价脚本或换 key 重跑。"
 					return r.resultJSON(response)
 				}
-				retryArguments := map[string]any{
-					"remote_session_id": remote.ID, "action": "run", "command": command,
-					"purpose": purpose, "scope": scope, "user_confirmed": true,
-				}
+				// 原样保留调用参数与幂等身份，避免恢复模板改变执行模式或请求指纹。
+				retryArguments := mcpresult.Arguments(req)
+				retryArguments["user_confirmed"] = true
 				if argvSpec != nil {
 					confirmationData["argv"] = envReq.Payload["argv"]
 					confirmationData["shell"] = false
-					delete(retryArguments, "command")
-					retryArguments["argv"] = envReq.Payload["argv"]
-					retryArguments["shell"] = false
-					if key, present := envReq.Payload["idempotency_key"]; present {
-						retryArguments["idempotency_key"] = key
-					}
-					if expected, present := envReq.Payload["expected_workspace"]; present {
-						retryArguments["expected_workspace"] = expected
-					}
-					if transition, present := envReq.Payload["workspace_transition"]; present {
-						retryArguments["workspace_transition"] = transition
-					}
 				}
-				addRecoveryAction(&response, "execute", "用户确认后使用相同 command/task 或 runtime+script、purpose 和 remote_session_id 重试，并设置 user_confirmed=true", retryArguments)
+				addRecoveryAction(&response, "execute", "用户确认后保留完整原始请求及 idempotency_key，仅设置 user_confirmed=true；重试不得换 key 或改写参数", retryArguments)
 				return r.resultJSON(response)
 			}
 			result, executeErr := executeApproved(yield)
