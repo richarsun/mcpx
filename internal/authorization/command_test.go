@@ -888,6 +888,10 @@ func TestClassifierAllowsTrustedWindowsSystemCredentialManager(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("trusted Git for Windows credential manager positive path is Windows-only")
 	}
+	// Isolate the positive fixture from the user's real global Git config. The
+	// production classifier must still reject any URL-scoped helper it sees;
+	// this fixture intentionally exposes only the trusted system manager first.
+	t.Setenv("HOME", t.TempDir())
 	workspace, repo := newGitFixture(t)
 	ctx := withGrantTestExecutables(t, context.Background())
 	runGit(t, repo, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
