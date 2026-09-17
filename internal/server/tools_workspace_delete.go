@@ -248,6 +248,7 @@ type moveOutTargetResult struct {
 	Status         string `json:"status"`
 	QuarantinePath string `json:"quarantine_path,omitempty"`
 	ErrorCode      string `json:"error_code,omitempty"`
+	ErrorMessage   string `json:"error_message,omitempty"`
 }
 
 func (r *Runtime) commitMoveOutManifest(ctx context.Context, envReq envelope.Request, principal auth.Principal, session remotesession.Session, item deletion.Request) moveOutCommitResult {
@@ -290,18 +291,15 @@ func (r *Runtime) commitMoveOutManifest(ctx context.Context, envReq envelope.Req
 		trashPath := "trash://" + filepath.ToSlash(filepath.Base(target.Path))
 		trashLocation := "trash://"
 		moved := false
+		var moveErr error
 
 		switch platform {
 		case "windows":
-			script := `$ErrorActionPreference='Stop'; Add-Type -AssemblyName Microsoft.VisualBasic; $p=$args[0]; $entry=Get-Item -LiteralPath $p -Force; if ($entry.PSIsContainer) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,[Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException) } else { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,[Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException) }`
-			_ = boundedCommand(ctx, workspacePath, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script, source)
-			if _, statErr := os.Lstat(source); errors.Is(statErr, os.ErrNotExist) {
+			moveErr = recycleWindowsTarget(ctx, workspacePath, source)
+			if _, statErr := os.Lstat(source); moveErr == nil && errors.Is(statErr, os.ErrNotExist) {
 				moved = true
-			} else {
-				_ = boundedCommand(ctx, workspacePath, "pwsh.exe", "-NoProfile", "-NonInteractive", "-Command", script, source)
-				if _, statErr := os.Lstat(source); errors.Is(statErr, os.ErrNotExist) {
-					moved = true
-				}
+			} else if moveErr == nil {
+				moveErr = errors.New("recycle command finished but source disappearance could not be verified")
 			}
 			trashPath = "recycle-bin://" + filepath.ToSlash(filepath.Base(target.Path))
 			trashLocation = "recycle-bin://"
@@ -382,7 +380,11 @@ func (r *Runtime) commitMoveOutManifest(ctx context.Context, envReq envelope.Req
 
 		entry := entries[0]
 		if !moved {
-			result.Targets = append(result.Targets, moveOutTargetResult{Path: entry.Path, Kind: finalKind, ExpectedSHA256: entry.ExpectedSHA256, Size: entry.Size, Status: "failed", ErrorCode: "MOVE_OUT_FAILED"})
+			message := ""
+			if moveErr != nil {
+				message = moveErr.Error()
+			}
+			result.Targets = append(result.Targets, moveOutTargetResult{Path: entry.Path, Kind: finalKind, ExpectedSHA256: entry.ExpectedSHA256, Size: entry.Size, Status: "failed", ErrorCode: "MOVE_OUT_FAILED", ErrorMessage: message})
 			result.FailedCount++
 			continue
 		}
