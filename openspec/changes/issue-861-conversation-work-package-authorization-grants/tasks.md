@@ -52,5 +52,8 @@
 - [x] 正常 HOME 复现 RED 并实现固定 global GitHub CLI helper 链支持，不修改凭据或真实用户配置。
 - [x] Windows authorization 整包 PASS 154.410s（含正常 HOME 分类）；Runtime conversation/recovery 定向 PASS 54.948s；新 helper race PASS 24.008s；受影响包 vet、gofmt 与 OpenSpec strict PASS。
 - [x] 正常 HOME Runtime 实际 GitHub HTTPS 验收 PASS 18.937s：同一 grant 的 fetch / push exit 0；push 为原 PR 分支相同提交回推，远端 OID 不变；revoke 后新 push 回确认，已完成 push 重放原 Task 且 attach exit 0。长任务的幂等原回执可能仍为 accepted，终态须从原 Task 回读。验收默认跳过，显式 `MCPX_TEST_REAL_GH_NETWORK=1` 才联网。
-- [ ] 冻结新候选，原独立 Reviewer 审核增量并解除适用 HOLD。
-- [ ] 精确制品/回滚准备、本机部署、真实 fetch/push/Draft PR/grant 撤销及结果重放验收。
+- [x] 原独立 Reviewer 对 `c872caa0330b13b26ffb96d46c1750f4093d8d24` / tree `9890a8315ba1f21b7c0ea5e76c484948fa8aac65` 复审安全与正常 HOME 适用性 PASS，解除原 HOLD；无源码返修要求。审核对话 `6aab8736-1788-83ee-b735-1c04117428f8`，结果消息 `54bd2a99-7889-4059-8a21-76e4d885c1b4`；configured/actual model UNKNOWN。
+- [x] 按真人四步实施及本机部署授权，将 `c872caa` / `0.9.9-issue861-gh` 安装至 controller-win-01；制品 SHA256 `819E901236E5EF43DF130A4A74C9682DC505BEBEE04DE9E0FE73ADDB9A752D67`，实际 MCP runtime 回读一致。旧 `3ab6574` 程序和 SQLite 一致性备份保存在本机 MCPX rollback/issue861-c872caa-20260917；真实 Git/运行时配置哈希未变。
+- [x] 在 ChatGPT MCPX 插件详情刷新工具定义，确认新的 authorization 字段和完整 operation_manage 参数已生效；原 Session/历史 Task 保留。
+- [ ] 完成安装后真实 MCP read/edit/commit/fetch/push/Draft PR/grant 撤销及结果重放验收；当前实机 fetch 已复用授权并 exit 0。
+- [ ] STABLE_BRANCH_SYNC_PENDING：当前仍部署 feature branch 候选，PR #3 保持 Draft，未合 main、未 Tag/Release；main 自动发布须单独处理。
