@@ -55,5 +55,6 @@
 - [x] 原独立 Reviewer 对 `c872caa0330b13b26ffb96d46c1750f4093d8d24` / tree `9890a8315ba1f21b7c0ea5e76c484948fa8aac65` 复审安全与正常 HOME 适用性 PASS，解除原 HOLD；无源码返修要求。审核对话 `6aab8736-1788-83ee-b735-1c04117428f8`，结果消息 `54bd2a99-7889-4059-8a21-76e4d885c1b4`；configured/actual model UNKNOWN。
 - [x] 按真人四步实施及本机部署授权，将 `c872caa` / `0.9.9-issue861-gh` 安装至 controller-win-01；制品 SHA256 `819E901236E5EF43DF130A4A74C9682DC505BEBEE04DE9E0FE73ADDB9A752D67`，实际 MCP runtime 回读一致。旧 `3ab6574` 程序和 SQLite 一致性备份保存在本机 MCPX rollback/issue861-c872caa-20260917；真实 Git/运行时配置哈希未变。
 - [x] 在 ChatGPT MCPX 插件详情刷新工具定义，确认新的 authorization 字段和完整 operation_manage 参数已生效；原 Session/历史 Task 保留。
-- [ ] 完成安装后真实 MCP read/edit/commit/fetch/push/Draft PR/grant 撤销及结果重放验收；当前实机 fetch 已复用授权并 exit 0。
+- [x] 安装后真实 MCP 验收 PASS：read/edit 成功；同一 grant `grant_0a6615b8d7e246b995028acb25e2ff95` 下 fetch、PR #3 读取、add、commit `dbec0cf`、push 均复用授权且 exit 0。fetch Task `task_e93cb1fd00bf8764`；push Task `task_6836bdf57ac0e6c8`。撤销后新 push 返回 `waiting_confirmation` / `grant_status:revoked`，未继续确认；相同已完成 push 重放 `idempotent_replay=true` 且返回原 Task，attach 再读 exit 0。
+- [x] 部署后文档提交只补任务证据，不改变已审核/已安装生产代码 `c872caa`；测试不覆盖永久账号身份绑定、敌对同用户并发改写 Git 配置、第二账号或全部 L1/L2 命令。普通代码执行测试仍保留确认，平台限流/安全提示不由 MCPX grant 消除。
 - [ ] STABLE_BRANCH_SYNC_PENDING：当前仍部署 feature branch 候选，PR #3 保持 Draft，未合 main、未 Tag/Release；main 自动发布须单独处理。
